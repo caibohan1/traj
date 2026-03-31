@@ -1,0 +1,150 @@
+#include <rclcpp/rclcpp.hpp>
+#include <px4_msgs/msg/trajectory_setpoint.hpp>
+#include <nav_msgs/msg/path.hpp>                 
+#include <geometry_msgs/msg/pose_stamped.hpp>    
+#include <chrono>
+#include <cmath>
+
+using namespace std::chrono_literals;
+
+class TrajectoryPlanner : public rclcpp::Node
+{
+public:
+    TrajectoryPlanner() : Node("trajectory_planner")
+    {
+        // 1. 发布给 PX4 控制器的控制指令
+        setpoint_pub_ = this->create_publisher<px4_msgs::msg::TrajectorySetpoint>(
+            "/geometric_controller/setpoint", 10);
+
+        // 2. 发布给 RViz2 的可视化路径
+        path_pub_ = this->create_publisher<nav_msgs::msg::Path>(
+            "/geometric_controller/expected_path", 10);
+
+        time_step_ = 0;
+        
+        // 在节点启动时，提前计算好一整圈的 8 字形路径，用于可视化
+        init_visual_path();
+
+        // 100Hz 频率发布轨迹 (与底层控制器匹配)
+        timer_ = this->create_wall_timer(
+            10ms, std::bind(&TrajectoryPlanner::timer_callback, this));
+            
+        RCLCPP_INFO(this->get_logger(), "Figure-8 Trajectory Planner (with Smooth Takeoff) Started.");
+    }
+
+private:
+    rclcpp::Publisher<px4_msgs::msg::TrajectorySetpoint>::SharedPtr setpoint_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_; 
+    rclcpp::TimerBase::SharedPtr timer_;
+    
+    nav_msgs::msg::Path expected_path_; 
+    uint64_t time_step_;
+
+    void init_visual_path()
+    {
+        double R = 3.0;
+        double omega = 0.25;
+        
+        // RViz 需要一个坐标系 Reference Frame
+        expected_path_.header.frame_id = "map"; 
+
+        double T = 2.0 * M_PI / omega; 
+        double dt = 0.1; 
+
+        for (double t = 0; t <= T; t += dt) {
+            geometry_msgs::msg::PoseStamped pose;
+            pose.pose.position.x = R * std::sin(omega * t);
+            pose.pose.position.y = R * std::sin(2.0 * omega * t);
+            // 静态可视化路径固定在目标高度 -5.0，作为最终跟踪的参考线
+            pose.pose.position.z = -5.0; 
+
+            expected_path_.poses.push_back(pose);
+        }
+        RCLCPP_INFO(this->get_logger(), "Visual Path initialized with %zu points.", expected_path_.poses.size());
+    }
+
+    void timer_callback()
+    {
+        px4_msgs::msg::TrajectorySetpoint msg{};
+        
+        double t = static_cast<double>(time_step_) * 0.01; // 10ms step -> 0.01s
+        double R = 3.0;        // 轨迹振幅
+        double omega = 0.25;   // 基础角速度
+
+        // ================= 【新增】Z 轴五阶多项式起飞缓冲 =================
+        double target_z = -5.0;     // 目标高度
+        double takeoff_time = 5.0;  // 起飞缓冲时间设为 5 秒
+        
+        double pz, vz, az, jz;
+        
+        if (t < takeoff_time) {
+            // 计算归一化时间 tau (从 0 到 1)
+            double tau = t / takeoff_time;
+            double tau2 = tau * tau;
+            double tau3 = tau2 * tau;
+            double tau4 = tau3 * tau;
+            double tau5 = tau4 * tau;
+            
+            // 五阶多项式 (Minimum Jerk Trajectory) 保证速度和加速度在起末两端都为 0
+            // 位置 z(t)
+            pz = target_z * (10.0 * tau3 - 15.0 * tau4 + 6.0 * tau5);
+            // 速度 vz(t) (对位置求导)
+            vz = (target_z / takeoff_time) * (30.0 * tau2 - 60.0 * tau3 + 30.0 * tau4);
+            // 加速度 az(t) (对速度求导)
+            az = (target_z / (takeoff_time * takeoff_time)) * (60.0 * tau - 180.0 * tau2 + 120.0 * tau3);
+            // 加加速度 jz(t) (对加速度求导)
+            jz = (target_z / (takeoff_time * takeoff_time * takeoff_time)) * (60.0 - 360.0 * tau + 360.0 * tau2);
+        } else {
+            // 达到设定时间后，保持在目标高度
+            pz = target_z;
+            vz = 0.0;
+            az = 0.0;
+            jz = 0.0;
+        }
+
+        // ================= X / Y 轴保持 8 字形连续运动 =================
+        double px = R * std::sin(omega * t);
+        double py = R * std::sin(2.0 * omega * t);
+        
+        double vx = R * omega * std::cos(omega * t);
+        double vy = 2.0 * R * omega * std::cos(2.0 * omega * t);
+        
+        double ax = -R * omega * omega * std::sin(omega * t);
+        double ay = -4.0 * R * omega * omega * std::sin(2.0 * omega * t);
+        
+        double jx = -R * omega * omega * omega * std::cos(omega * t);
+        double jy = -8.0 * R * omega * omega * omega * std::cos(2.0 * omega * t);
+
+        // --- 赋值给 msg ---
+        msg.position = {(float)px, (float)py, (float)pz};
+        msg.velocity = {(float)vx, (float)vy, (float)vz};
+        msg.acceleration = {(float)ax, (float)ay, (float)az};
+        msg.jerk = {(float)jx, (float)jy, (float)jz};
+
+        // ================= 计算期望偏航角和角速度 =================
+        msg.yaw = (float)std::atan2(vy, vx);
+        double velocity_sq = vx * vx + vy * vy;
+        if (velocity_sq > 1e-4) {
+            msg.yawspeed = (float)((vx * ay - vy * ax) / velocity_sq);
+        } else {
+            msg.yawspeed = 0.0f;
+        }
+
+        msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
+        setpoint_pub_->publish(msg);
+
+        // 每次循环也把可视化路径发出去
+        expected_path_.header.stamp = this->get_clock()->now();
+        path_pub_->publish(expected_path_);
+
+        time_step_++;
+    }
+};
+
+int main(int argc, char *argv[])
+{
+    rclcpp::init(argc, argv);
+    rclcpp::spin(std::make_shared<TrajectoryPlanner>());
+    rclcpp::shutdown();
+    return 0;
+}

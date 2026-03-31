@@ -1,0 +1,300 @@
+#include <rclcpp/rclcpp.hpp>
+#include <px4_msgs/msg/offboard_control_mode.hpp>
+#include <px4_msgs/msg/vehicle_command.hpp>
+#include <px4_msgs/msg/vehicle_odometry.hpp>
+#include <px4_msgs/msg/trajectory_setpoint.hpp>
+#include <px4_msgs/msg/vehicle_thrust_setpoint.hpp>
+#include <px4_msgs/msg/vehicle_torque_setpoint.hpp>
+#include <Eigen/Dense>
+#include <chrono>
+
+using namespace std::chrono_literals;
+
+class GeometricController : public rclcpp::Node
+{
+public:
+    GeometricController() : Node("geometric_controller")
+    {
+        // --- Publishers (与 PX4 通信) ---
+        offboard_control_mode_pub_ = this->create_publisher<px4_msgs::msg::OffboardControlMode>("/fmu/in/offboard_control_mode", 10);
+        vehicle_command_pub_       = this->create_publisher<px4_msgs::msg::VehicleCommand>("/fmu/in/vehicle_command", 10);
+        thrust_pub_                = this->create_publisher<px4_msgs::msg::VehicleThrustSetpoint>("/fmu/in/vehicle_thrust_setpoint", 10);
+        torque_pub_                = this->create_publisher<px4_msgs::msg::VehicleTorqueSetpoint>("/fmu/in/vehicle_torque_setpoint", 10);
+
+        // --- Subscribers ---
+        odom_sub_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>(
+            "/fmu/out/vehicle_odometry", rclcpp::QoS(10).best_effort(),
+            [this](const px4_msgs::msg::VehicleOdometry::SharedPtr msg) { current_odom_ = *msg; has_odom_ = true; });
+
+        setpoint_sub_ = this->create_subscription<px4_msgs::msg::TrajectorySetpoint>(
+            "/geometric_controller/setpoint", 10,
+            [this](const px4_msgs::msg::TrajectorySetpoint::SharedPtr msg) { current_setpoint_ = *msg; has_setpoint_ = true; });
+
+        // --- Timer (100Hz 控制循环) ---
+        timer_ = this->create_wall_timer(10ms, std::bind(&GeometricController::control_loop, this));
+        
+        RCLCPP_INFO(this->get_logger(), "Hardcore Geometric Controller (with Strict Linear System Flatness) Started.");
+    }
+
+private:
+    rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr offboard_control_mode_pub_;
+    rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr vehicle_command_pub_;
+    rclcpp::Publisher<px4_msgs::msg::VehicleThrustSetpoint>::SharedPtr thrust_pub_;
+    rclcpp::Publisher<px4_msgs::msg::VehicleTorqueSetpoint>::SharedPtr torque_pub_;
+    
+    rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr odom_sub_;
+    rclcpp::Subscription<px4_msgs::msg::TrajectorySetpoint>::SharedPtr setpoint_sub_;
+    rclcpp::TimerBase::SharedPtr timer_;
+
+    px4_msgs::msg::VehicleOdometry current_odom_;
+    px4_msgs::msg::TrajectorySetpoint current_setpoint_;
+    
+    bool has_odom_ = false;
+    bool has_setpoint_ = false;
+    uint64_t offboard_setpoint_counter_ = 0;
+    // ====== 【新增：Z 轴积分误差累加器】 ======
+    double integral_error_z_ = 0.0;
+
+    // 反对称矩阵的 Vee 映射 (将反对称矩阵还原为向量) [cite: 593, 594]
+    Eigen::Vector3d vee_map(const Eigen::Matrix3d& S) const {
+        return Eigen::Vector3d(S(2, 1), S(0, 2), S(1, 0));
+    }
+
+    void control_loop()
+    {
+        if (!has_odom_ || !has_setpoint_) return;
+
+        // 发送 Offboard 心跳
+        publish_offboard_control_mode();
+
+        // 解锁并切换模式
+        if (offboard_setpoint_counter_ == 50) { 
+            publish_vehicle_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1, 6); // Offboard
+            publish_vehicle_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0); // Arm
+            RCLCPP_INFO(this->get_logger(), "Arming and setting Offboard mode!");
+        }
+        if (offboard_setpoint_counter_ < 100) offboard_setpoint_counter_++;
+
+        // 执行核心几何控制算法
+        compute_and_publish_control();
+    }
+
+    void compute_and_publish_control()
+    {
+        // ================= 物理参数 (基于 gz_x500) =================
+        const double m = 1.535; // kg
+        const double g = 9.81;  // m/s^2
+        const double max_thrust = 24.0; // N
+        const Eigen::Vector3d max_torque(0.5, 0.5, 0.5); // Nm
+        
+        // 惯性张量 J [cite: 496]
+        Eigen::Matrix3d J;
+        J << 0.016, 0,     0,
+             0,     0.016, 0,
+             0,     0,     0.021;
+
+        // 空气动力学线性阻力矩阵 D (基于文献辨识结果)
+        Eigen::Matrix3d D;
+        D << 0.15, 0.0, 0.0,
+             0.0, 0.15, 0.0,
+             0.0, 0.0, 0.0;
+        // =====================================
+
+        // ================= 进阶控制增益 =================
+        // 位置环：强力追踪
+        Eigen::Matrix3d K_p = Eigen::Vector3d(2.5, 2.5, 4.0).asDiagonal();
+        Eigen::Matrix3d K_v = Eigen::Vector3d(1.5, 1.5, 1.5).asDiagonal();
+
+        // 【新增：Z 轴的积分增益 K_i】
+        double K_i_z = 2.0;
+
+        // 姿态环：刚度提高，阻尼正常化 (因为有了 omega_d 前馈，阻尼不再是累赘)
+        Eigen::Matrix3d K_R = Eigen::Vector3d(0.6, 0.6, 3.0).asDiagonal();
+        Eigen::Matrix3d K_w = Eigen::Vector3d(0.08, 0.08, 0.14).asDiagonal();
+
+        // ================= 1. 提取当前状态 (NED / FRD) =================
+        Eigen::Vector3d p(current_odom_.position[0], current_odom_.position[1], current_odom_.position[2]);
+        Eigen::Vector3d v(current_odom_.velocity[0], current_odom_.velocity[1], current_odom_.velocity[2]);
+        Eigen::Quaterniond q(current_odom_.q[0], current_odom_.q[1], current_odom_.q[2], current_odom_.q[3]);
+        Eigen::Matrix3d R = q.toRotationMatrix();
+        Eigen::Vector3d omega(current_odom_.angular_velocity[0], current_odom_.angular_velocity[1], current_odom_.angular_velocity[2]);
+
+        // ================= 2. 提取期望状态 (包含 Jerk 和 Yawspeed) =================
+        Eigen::Vector3d p_d(current_setpoint_.position[0], current_setpoint_.position[1], current_setpoint_.position[2]);
+        Eigen::Vector3d v_d(current_setpoint_.velocity[0], current_setpoint_.velocity[1], current_setpoint_.velocity[2]);
+        Eigen::Vector3d a_d(current_setpoint_.acceleration[0], current_setpoint_.acceleration[1], current_setpoint_.acceleration[2]);
+        Eigen::Vector3d j_d(current_setpoint_.jerk[0], current_setpoint_.jerk[1], current_setpoint_.jerk[2]); // 轨迹三阶导数
+        
+        double yaw_d = current_setpoint_.yaw;
+        double yawspeed_d = current_setpoint_.yawspeed;
+
+        // ================= 3. 位置环：计算期望推力 =================
+        Eigen::Vector3d e_p = p - p_d;
+        Eigen::Vector3d e_v = v - v_d;
+        
+        // 累加 Z 轴积分误差，步长 dt = 0.01s (100Hz)
+        integral_error_z_ += e_p.z() * 0.01;
+        // 抗积分饱和 (Anti-windup)
+        integral_error_z_ = std::clamp(integral_error_z_, -3.0, 3.0);
+    
+        // 利用实际速度 v 和姿态 R 计算世界坐标系下的阻力向量
+        Eigen::Vector3d F_drag = m * R * D * R.transpose() * v_d;
+        // 计算期望的机体受力 F_des (向上，即 -Z 方向)
+        Eigen::Vector3d F_des = -K_p * e_p - K_v * e_v + m * a_d - Eigen::Vector3d(0, 0, m * g) + F_drag;
+        // 将积分作用力注入到 Z 轴
+        F_des.z() -= K_i_z * integral_error_z_;
+
+        // 期望推力向量 T_vec (向下，沿着机体 Z 轴)
+        Eigen::Vector3d T_vec = -F_des; 
+        double T_norm = T_vec.norm();
+
+        // ================= 4. 几何映射：计算期望姿态 R_d =================
+        Eigen::Vector3d z_b_d = T_vec.normalized(); 
+        
+        Eigen::Vector3d x_c(std::cos(yaw_d), std::sin(yaw_d), 0.0);
+        Eigen::Vector3d y_c(-std::sin(yaw_d), std::cos(yaw_d), 0.0);
+        
+        Eigen::Vector3d y_b_d = z_b_d.cross(x_c).normalized();
+        Eigen::Vector3d x_b_d = y_b_d.cross(z_b_d);
+        
+        Eigen::Matrix3d R_d;
+        R_d << x_b_d, y_b_d, z_b_d; // [cite: 559]
+
+        // 姿态误差 e_R [cite: 597, 598]
+        Eigen::Matrix3d err_matrix = 0.5 * (R_d.transpose() * R - R.transpose() * R_d);
+        Eigen::Vector3d e_R = vee_map(err_matrix);
+
+        // ================= 5. 微分平坦性：严格求解 3x3 线性方程组解算 omega_d =================
+        double d_x = D(0,0);
+        double d_y = D(1,1);
+        double d_z = D(2,2);
+        
+        // 归一化推力常数
+        double c = T_norm / m; 
+        
+        // 期望速度和加速度、加加速度在期望机体坐标轴上的投影
+        double v_x = x_b_d.dot(v_d);
+        double v_y = y_b_d.dot(v_d);
+        double v_z = z_b_d.dot(v_d);
+        
+        double a_x = x_b_d.dot(a_d);
+        double a_y = y_b_d.dot(a_d);
+        
+        double j_x = x_b_d.dot(j_d);
+        double j_y = y_b_d.dot(j_d);
+
+        Eigen::Vector3d y_c_cross_z_b_d = y_c.cross(z_b_d);
+
+        // 构建 3x3 线性方程组 M_omega * omega_d = b_omega
+        Eigen::Matrix3d M_omega;
+        M_omega.setZero();
+        
+        // 来源于 Faessler 文献方程 (17) 
+        M_omega(0, 1) = c - (d_z - d_x) * v_z;
+        M_omega(0, 2) = -(d_x - d_y) * v_y;
+        
+        // 来源于 Faessler 文献方程 (18) 
+        M_omega(1, 0) = -(c + (d_y - d_z) * v_z);
+        M_omega(1, 2) = (d_x - d_y) * v_x;
+        
+        // 来源于 Faessler 文献方程 (25) 整理变形 
+        M_omega(2, 1) = -y_c.dot(z_b_d);
+        M_omega(2, 2) = y_c_cross_z_b_d.norm();
+
+        // 构造右侧已知偏置向量 b_omega
+        Eigen::Vector3d b_omega;
+        b_omega(0) = j_x + d_x * a_x;
+        b_omega(1) = -j_y - d_y * a_y;
+        b_omega(2) = yawspeed_d * x_c.dot(x_b_d);
+
+        // 利用 Eigen 矩阵求逆求解完全耦合的期望角速度
+        Eigen::Vector3d omega_d = M_omega.inverse() * b_omega;
+        
+        // 为了兼容之前的变量名，这里单独提取
+        double omega_d_x = omega_d(0);
+        double omega_d_y = omega_d(1);
+        double omega_d_z = omega_d(2);
+        // =========================================================================
+
+        // ================= 6. 姿态环：计算控制力矩 tau =================
+        // 角速度误差 e_omega (引入 omega_d) [cite: 601, 602]
+        Eigen::Vector3d e_w = omega - R.transpose() * R_d * omega_d;
+
+        // SE(3) 完整力矩控制律 [cite: 617, 618]
+        Eigen::Vector3d tau = -K_R * e_R - K_w * e_w + omega.cross(J * omega) 
+                              - J * (omega.cross(R.transpose() * R_d * omega_d));
+
+        // ================= 7. 计算最终推力大小并发布 =================
+        // 实际推力是 F_des 投影到当前机体 -Z 轴上 [cite: 617]
+        double f = -F_des.dot(R.col(2));
+        if (f < 0.0) f = 0.0; // 限制推力下限
+
+        publish_thrust_and_torque(f, tau, max_thrust, max_torque);
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
+                     "Omega_d: [%.3f, %.3f, %.3f], Jerk: [%.3f, %.3f, %.3f]", 
+                     omega_d_x, omega_d_y, omega_d_z, j_d[0], j_d[1], j_d[2]);
+    }
+
+    void publish_thrust_and_torque(double f, const Eigen::Vector3d& tau, double max_f, const Eigen::Vector3d& max_tau)
+    {
+        auto timestamp = this->get_clock()->now().nanoseconds() / 1000;
+
+        // 1. 发布推力
+        px4_msgs::msg::VehicleThrustSetpoint thrust_msg{};
+        thrust_msg.timestamp = timestamp;
+        
+        // FRD 坐标系中，Z 轴向下，产生升力需要向上的力，故给负值！
+        double thrust_norm = std::clamp(f / max_f, 0.0, 1.0);
+        thrust_msg.xyz[0] = 0.0;
+        thrust_msg.xyz[1] = 0.0;
+        thrust_msg.xyz[2] = -thrust_norm; 
+        
+        thrust_pub_->publish(thrust_msg);
+
+        // 2. 发布力矩
+        px4_msgs::msg::VehicleTorqueSetpoint torque_msg{};
+        torque_msg.timestamp = timestamp;
+        
+        torque_msg.xyz[0] = std::clamp(tau.x() / max_tau.x(), -1.0, 1.0);
+        torque_msg.xyz[1] = std::clamp(tau.y() / max_tau.y(), -1.0, 1.0);
+        torque_msg.xyz[2] = std::clamp(tau.z() / max_tau.z(), -1.0, 1.0);
+        
+        torque_pub_->publish(torque_msg);
+    }
+
+    void publish_offboard_control_mode()
+    {
+        px4_msgs::msg::OffboardControlMode msg{};
+        msg.position = false;
+        msg.velocity = false;
+        msg.acceleration = false;
+        msg.attitude = false;
+        msg.body_rate = false;
+        msg.thrust_and_torque = true; 
+        msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
+        offboard_control_mode_pub_->publish(msg);
+    }
+
+    void publish_vehicle_command(uint16_t command, float param1 = 0.0, float param2 = 0.0)
+    {
+        px4_msgs::msg::VehicleCommand msg{};
+        msg.param1 = param1;
+        msg.param2 = param2;
+        msg.command = command;
+        msg.target_system = 1;
+        msg.target_component = 1;
+        msg.source_system = 1;
+        msg.source_component = 1;
+        msg.from_external = true;
+        msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
+        vehicle_command_pub_->publish(msg);
+    }
+};
+
+int main(int argc, char *argv[])
+{
+    rclcpp::init(argc, argv);
+    rclcpp::spin(std::make_shared<GeometricController>());
+    rclcpp::shutdown();
+    return 0;
+}
