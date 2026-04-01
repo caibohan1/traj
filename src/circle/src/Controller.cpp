@@ -79,6 +79,26 @@ private:
         // 超时保护：超过 0.5s 没收到轨迹
         if ((this->get_clock()->now() - last_setpoint_time_).seconds() > 0.5) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Setpoint timeout! Danger!");
+            // 当 Planner 关闭后，这里必定会触发。我们检查飞机是否已经在地面：
+            // NED 坐标系下，Z > -0.3 代表高度低于 0.3 米；同时三轴速度极小
+            bool is_grounded = (current_odom_.position[2] > -0.3) &&
+                               (std::abs(current_odom_.velocity[0]) < 0.2) &&
+                               (std::abs(current_odom_.velocity[1]) < 0.2) &&
+                               (std::abs(current_odom_.velocity[2]) < 0.2);
+
+            if (is_grounded) {
+                RCLCPP_INFO(this->get_logger(), "Planner offline and drone is grounded. Disarming and shutting down...");
+                
+                // 发送安全上锁 (Disarm) 指令，param1 = 0.0 代表 Disarm
+                publish_vehicle_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0);
+                
+                rclcpp::shutdown(); // 优雅关闭控制器节点
+                return;
+            } else {
+                // 如果在半空中丢信号了，这才是真正的危险情况
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Setpoint timeout in Mid-Air! Danger!");
+            }       
+        
         }
 
         // 强化解锁逻辑：在 50 到 100 周期之间，每 10 个周期发一次，确保飞控确实收到了解锁和切模式指令
