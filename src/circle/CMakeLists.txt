@@ -16,6 +16,7 @@ find_package(Eigen3 REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(mavros_msgs REQUIRED)
 
 # 包含 Eigen 头文件
 include_directories(${EIGEN3_INCLUDE_DIRS})
@@ -36,12 +37,44 @@ ament_target_dependencies(eight_planner rclcpp px4_msgs nav_msgs geometry_msgs s
 add_executable(controller_node src/Controller.cpp)
 ament_target_dependencies(controller_node rclcpp px4_msgs Eigen3 std_msgs)
 
+# mav轨迹规划器节点
+add_executable(mavcircle_planner src/Mav_circlecontrol.cpp)
+ament_target_dependencies(mavcircle_planner
+  rclcpp
+  std_msgs
+  geometry_msgs
+  nav_msgs
+  mavros_msgs
+)
+
+# mav轨迹规划器节点
+add_executable(maveight_planner src/Mav_eightcontrol.cpp)
+ament_target_dependencies(maveight_planner
+  rclcpp
+  std_msgs
+  geometry_msgs
+  nav_msgs
+  mavros_msgs
+)
+
+# 几何控制器节点
+add_executable(mavController src/Mav_Controller.cpp)
+ament_target_dependencies(mavController
+  rclcpp
+  std_msgs
+  nav_msgs
+  mavros_msgs
+)
+target_link_libraries(geometric_controller Eigen3::Eigen) # 链接 Eigen3
 # 安装可执行文件
 install(TARGETS
   trajectory_planner
   geometric_controller
   eight_planner
   controller_node
+  mavcircle_planner
+  maveight_planner
+  mavController
   DESTINATION lib/${PROJECT_NAME}
 )
 
