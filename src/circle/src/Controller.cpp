@@ -4,7 +4,6 @@
 #include <px4_msgs/msg/vehicle_odometry.hpp>
 #include <px4_msgs/msg/trajectory_setpoint.hpp>
 #include <px4_msgs/msg/vehicle_attitude_setpoint.hpp>
-#include <std_msgs/msg/float64_multi_array.hpp> // 完美适配 planner 的扩展通道
 #include <Eigen/Dense>
 #include <chrono>
 #include <algorithm>
@@ -30,13 +29,6 @@ public:
                 last_setpoint_time_ = this->get_clock()->now();
             });
 
-        // 接收 Planner 发来的 Snap 和 YawAccel (本控制器输出姿态，暂不参与核心计算，但保持接口畅通)
-        ext_setpoint_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
-            "/geometric_controller/traj_ext", 10,
-            [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) { 
-                if(msg->data.size() >= 4) { current_ext_ = *msg; has_ext_ = true; } 
-            });
-
         odom_sub_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>(
             "/fmu/out/vehicle_odometry", rclcpp::QoS(10).best_effort(),
             [this](const px4_msgs::msg::VehicleOdometry::SharedPtr msg) { 
@@ -55,16 +47,13 @@ private:
     
     rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr odom_sub_;
     rclcpp::Subscription<px4_msgs::msg::TrajectorySetpoint>::SharedPtr setpoint_sub_;
-    rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr ext_setpoint_sub_;
 
     px4_msgs::msg::VehicleOdometry current_odom_;
     px4_msgs::msg::TrajectorySetpoint current_setpoint_;
-    std_msgs::msg::Float64MultiArray current_ext_;
     rclcpp::Time last_setpoint_time_;
     
     bool has_odom_ = false;
     bool has_setpoint_ = false;
-    bool has_ext_ = false;
     uint64_t offboard_setpoint_counter_ = 0;
     
     double integral_error_z_ = 0.0;
@@ -79,7 +68,7 @@ private:
         // 超时保护：超过 0.5s 没收到轨迹
         if ((this->get_clock()->now() - last_setpoint_time_).seconds() > 0.5) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Setpoint timeout! Danger!");
-            // 当 Planner 关闭后，这里必定会触发。我们检查飞机是否已经在地面：
+            
             // NED 坐标系下，Z > -0.3 代表高度低于 0.3 米；同时三轴速度极小
             bool is_grounded = (current_odom_.position[2] > -0.3) &&
                                (std::abs(current_odom_.velocity[0]) < 0.2) &&
@@ -89,19 +78,18 @@ private:
             if (is_grounded) {
                 RCLCPP_INFO(this->get_logger(), "Planner offline and drone is grounded. Disarming and shutting down...");
                 
-                // 发送安全上锁 (Disarm) 指令，param1 = 0.0 代表 Disarm
+                // 发送安全上锁 (Disarm) 指令
                 publish_vehicle_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0);
                 
-                rclcpp::shutdown(); // 优雅关闭控制器节点
+                rclcpp::shutdown(); 
                 return;
             } else {
-                // 如果在半空中丢信号了，这才是真正的危险情况
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Setpoint timeout in Mid-Air! Danger!");
+                return; // 防止僵尸节点继续发老指令
             }       
-        
         }
 
-        // 强化解锁逻辑：在 50 到 100 周期之间，每 10 个周期发一次，确保飞控确实收到了解锁和切模式指令
+        // 强化解锁逻辑：在 50 到 100 周期之间发切模式和解锁指令
         if (offboard_setpoint_counter_ >= 50 && offboard_setpoint_counter_ <= 100) { 
             if (offboard_setpoint_counter_ % 10 == 0) {
                 publish_vehicle_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1, 6); // Offboard
@@ -119,10 +107,10 @@ private:
     void compute_and_publish_control()
     {
         // ================= 物理参数 =================
-        const double m = 1.535; // kg (适合 gz_x500)
-        const double g = 9.81;  // m/s^2
-        const double max_thrust = 24.0; // N
-        const double max_tilt_angle = 45.0 * M_PI / 180.0; // 45 度安全倾角限制
+        const double m = 1.535; 
+        const double g = 9.81;  
+        const double max_thrust = 24.0; 
+        const double max_tilt_angle = 45.0 * M_PI / 180.0; 
 
         // 线性空气阻力系数矩阵
         Eigen::Matrix3d D;
@@ -184,11 +172,10 @@ private:
         Eigen::Vector3d T_vec = m * (g * e_3 - a_cmd - a_drag);
 
         // ================= 4. 安全硬限幅处理 (Output Clamping) =================
-        // 4.1 防止推力反向 (NED坐标系中，机体Z轴应当保持朝下，所以T_vec.z()必须为正数)
-        // 修复了之前的反向钳制 Bug！
+        // 防止推力反向 (NED坐标系中，机体Z轴应当保持朝下，所以T_vec.z()必须为正数)
         if (T_vec.z() < 0.1) T_vec.z() = 0.1; 
         
-        // 4.2 最大倾角圆锥钳制
+        // 最大倾角圆锥钳制
         double current_tilt_cos = std::abs(T_vec.z()) / T_vec.norm();
         if (current_tilt_cos < std::cos(max_tilt_angle)) {
             double max_xy_mag = std::abs(T_vec.z()) * std::tan(max_tilt_angle);

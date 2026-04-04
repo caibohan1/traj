@@ -5,7 +5,7 @@
 #include <mavros_msgs/msg/position_target.hpp>
 #include <mavros_msgs/srv/command_bool.hpp>
 #include <mavros_msgs/srv/set_mode.hpp>
-#include <std_msgs/msg/float64_multi_array.hpp>
+
 #include <Eigen/Dense>
 #include <chrono>
 #include <algorithm>
@@ -37,12 +37,6 @@ public:
                 last_setpoint_time_ = this->get_clock()->now();
             });
 
-        ext_setpoint_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
-            "/geometric_controller/traj_ext", 10,
-            [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) { 
-                if(msg->data.size() >= 4) { current_ext_ = *msg; has_ext_ = true; } 
-            });
-
         // 订阅 MAVROS 的本地里程计 (ENU)
         odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
             "/mavros/local_position/odom", rclcpp::QoS(10).best_effort(),
@@ -62,18 +56,16 @@ private:
     
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::Subscription<mavros_msgs::msg::PositionTarget>::SharedPtr setpoint_sub_;
-    rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr ext_setpoint_sub_;
     rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr state_sub_;
 
     nav_msgs::msg::Odometry current_odom_;
     mavros_msgs::msg::PositionTarget current_setpoint_;
-    std_msgs::msg::Float64MultiArray current_ext_;
     mavros_msgs::msg::State current_state_;
     
     rclcpp::Time last_setpoint_time_;
     bool has_odom_ = false;
     bool has_setpoint_ = false;
-    bool has_ext_ = false;
+
     uint64_t offboard_setpoint_counter_ = 0;
     
     double integral_error_z_ = 0.0;
