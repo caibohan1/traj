@@ -87,7 +87,7 @@ private:
     {
         double A = 2.0;
         double B = 1.0;
-        double omega_max = 1.8; 
+        double omega_max = 0.25; 
         double target_z = -1.8;
         
         expected_path_.header.frame_id = "map"; 
