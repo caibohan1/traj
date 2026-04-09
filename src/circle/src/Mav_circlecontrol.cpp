@@ -281,6 +281,15 @@ private:
         expected_path_.header.stamp = timestamp;
         path_pub_->publish(expected_path_);
 
+// 🌟 新增：打印实时期望轨迹（每 500 毫秒打印一次，防止 100Hz 刷爆 Ubuntu 终端）
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(), 
+            *this->get_clock(), 
+            500, 
+            "🎯 Setpoint -> X: % .3f, Y: % .3f, Z: % .3f | Mode Time: % .2f s", 
+            px, py, pz, t
+        );
+
         time_step_++;
     }
 };

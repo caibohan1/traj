@@ -65,6 +65,53 @@ ament_target_dependencies(mavController
   nav_msgs
   mavros_msgs
 )
+
+add_executable(px4_circle_trajectory src/px4_circle_trajectory.cpp)
+ament_target_dependencies(px4_circle_trajectory
+  rclcpp
+  px4_msgs
+  nav_msgs
+  geometry_msgs
+)
+
+add_executable(px4_eight_trajectory src/px4_eight_trajectory.cpp)
+
+# 链接目标依赖
+ament_target_dependencies(px4_eight_trajectory
+  rclcpp
+  px4_msgs
+  nav_msgs
+  geometry_msgs
+)
+
+add_executable(ratecontrol src/ratecontrol.cpp)
+ament_target_dependencies(ratecontrol
+  rclcpp
+  std_msgs
+  nav_msgs
+  px4_msgs
+)
+
+add_executable(rateeight src/rateeight.cpp)
+
+# 链接目标依赖
+ament_target_dependencies(rateeight
+  rclcpp
+  px4_msgs
+  nav_msgs
+  geometry_msgs
+)
+
+add_executable(ratecircle src/ratecircle.cpp)
+
+# 链接目标依赖
+ament_target_dependencies(ratecircle
+  rclcpp
+  px4_msgs
+  nav_msgs
+  geometry_msgs
+)
+
 target_link_libraries(geometric_controller Eigen3::Eigen) # 链接 Eigen3
 # 安装可执行文件
 install(TARGETS
@@ -75,6 +122,11 @@ install(TARGETS
   mavcircle_planner
   maveight_planner
   mavController
+  px4_circle_trajectory
+  px4_eight_trajectory
+  ratecontrol
+  rateeight
+  ratecircle
   DESTINATION lib/${PROJECT_NAME}
 )
 

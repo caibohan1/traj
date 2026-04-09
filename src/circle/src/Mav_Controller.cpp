@@ -121,7 +121,7 @@ void compute_and_publish_control()
     {
         const double m = 1.535; // kg 
         const double g = 9.81;  // m/s^2
-        const double max_thrust = 24.0; // N
+        const double max_thrust = 25.1; // N
         // 恢复到你原有的合理限幅 45 度
         const double max_tilt_angle = 45.0 * M_PI / 180.0; 
 
@@ -234,6 +234,15 @@ void compute_and_publish_control()
         msg.thrust = std::clamp(T_norm / max_thrust, 0.05, 0.95);
 
         att_sp_pub_->publish(msg);
+
+        // 🌟 新增：打印期望姿态四元数和发送给 MAVROS 的标量推力（每 500 毫秒打印一次）
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            500,
+            "📐 MAVROS Att Setpoint -> q: [%.2f, %.2f, %.2f, %.2f] | Raw Thrust(N): %.2f | Scaled Thrust: %.2f",
+            q_d.w(), q_d.x(), q_d.y(), q_d.z(), T_norm, msg.thrust
+        );
     }
 };
 

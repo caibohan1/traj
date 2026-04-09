@@ -109,7 +109,7 @@ private:
         // ================= 物理参数 =================
         const double m = 1.535; 
         const double g = 9.81;  
-        const double max_thrust = 24.0; 
+        const double max_thrust = 25.1; 
         const double max_tilt_angle = 45.0 * M_PI / 180.0; 
 
         // 线性空气阻力系数矩阵
@@ -217,6 +217,15 @@ private:
         msg.thrust_body[2] = -normalized_thrust; 
 
         att_sp_pub_->publish(msg);
+
+// 🌟 新增：打印期望姿态四元数和归一化推力（每 500 毫秒打印一次）
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(),
+            *this->get_clock(),
+            500,
+            "📐 Att Setpoint -> q: [%.2f, %.2f, %.2f, %.2f] | Thrust: %.2f (Norm: %.2f)",
+            q_d.w(), q_d.x(), q_d.y(), q_d.z(), T_norm, normalized_thrust
+        );
     }
 
     void publish_offboard_control_mode()

@@ -88,7 +88,7 @@ private:
     {
         double A = 2.0;  
         double B = 1.0;  
-        double omega_max = 0.25; 
+        double omega_max = 0.75; 
         double target_z = -1.8; // NED高度为负
         
         expected_path_.header.frame_id = "map"; 
@@ -142,7 +142,7 @@ private:
         // ================= 核心物理参数 =================
         const double A = 2.0;        
         const double B = 1.0;        
-        const double omega_max = 0.25;   
+        const double omega_max = 1.8;   
         const double target_z = -1.8;     
         
         const double T_takeoff = 5.0; 
@@ -282,6 +282,15 @@ private:
 
         expected_path_.header.stamp = timestamp;
         path_pub_->publish(expected_path_);
+
+// 🌟 新增：打印实时期望轨迹（每 500 毫秒打印一次，防止 100Hz 刷爆 Ubuntu 终端）
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(), 
+            *this->get_clock(), 
+            500, 
+            "🎯 Setpoint -> X: % .3f, Y: % .3f, Z: % .3f | Mode Time: % .2f s", 
+            px, py, pz, t
+        );
 
         time_step_++;
     }
