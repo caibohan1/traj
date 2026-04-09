@@ -133,7 +133,7 @@ private:
         // --- 核心物理参数 ---
         const double A = 2.0;        
         const double B = 1.0;        
-        const double omega_max = 1.8; // 高速大机动角速度
+        const double omega_max = 0.25; // 高速大机动角速度
         const double target_z = -1.8;  // 飞行高度
         
         const double T_takeoff = 5.0; 

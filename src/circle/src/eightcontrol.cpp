@@ -88,7 +88,7 @@ private:
     {
         double A = 2.0;  
         double B = 1.0;  
-        double omega_max = 0.75; 
+        double omega_max = 0.25; 
         double target_z = -1.8; // NED高度为负
         
         expected_path_.header.frame_id = "map"; 
