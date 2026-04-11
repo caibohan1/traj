@@ -57,7 +57,7 @@ public:
         timer_ = this->create_wall_timer(
             10ms, std::bind(&TrajectoryPlanner::timer_callback, this));
             
-        RCLCPP_INFO(this->get_logger(), "Clean MAVROS Figure-8 Planner (ENU) Started.");
+        RCLCPP_INFO(this->get_logger(), "Clean MAVROS Figure-8 Planner (ENU) with Error Logging Started.");
         RCLCPP_INFO(this->get_logger(), "Waiting for ARM and OFFBOARD mode from QGroundControl...");
     }
 
@@ -78,6 +78,12 @@ private:
     uint64_t time_step_;
 
     bool trajectory_started_ = false;
+
+    // 🌟 新增：用于统计巡航阶段误差的变量
+    double sum_error_x_ = 0.0;
+    double sum_error_y_ = 0.0;
+    double sum_error_z_ = 0.0;
+    uint64_t cruise_sample_count_ = 0;
 
     void init_visual_path()
     {
@@ -159,7 +165,21 @@ private:
         const double T_total = T_takeoff + T_accel + T_cruise + T_decel + T_land;
         const double T_wait_after_land = 3.0; 
         
+        // 🌟 新增：任务结束时，计算并打印统计误差
         if (t > T_total + T_wait_after_land) {
+            if (cruise_sample_count_ > 0) {
+                double mae_x = sum_error_x_ / cruise_sample_count_;
+                double mae_y = sum_error_y_ / cruise_sample_count_;
+                double mae_z = sum_error_z_ / cruise_sample_count_;
+                
+                RCLCPP_INFO(this->get_logger(), "==================================================");
+                RCLCPP_INFO(this->get_logger(), "📊 Cruise Phase Tracking Error Summary (MAE):");
+                RCLCPP_INFO(this->get_logger(), "   Mean Absolute Error X: %.4f m", mae_x);
+                RCLCPP_INFO(this->get_logger(), "   Mean Absolute Error Y: %.4f m", mae_y);
+                RCLCPP_INFO(this->get_logger(), "   Mean Absolute Error Z: %.4f m", mae_z);
+                RCLCPP_INFO(this->get_logger(), "   Total Samples Evaluated: %lu", cruise_sample_count_);
+                RCLCPP_INFO(this->get_logger(), "==================================================");
+            }
             RCLCPP_INFO(this->get_logger(), "Mission Accomplished. Shutting down Planner...");
             rclcpp::shutdown(); 
             return; 
@@ -279,6 +299,32 @@ private:
         msg.yaw = start_yaw_; 
         msg.yaw_rate = 0.0; 
 
+        // ================= 🌟 实时位置与误差计算打印 =================
+        double real_x = current_pose_.pose.position.x;
+        double real_y = current_pose_.pose.position.y;
+        double real_z = current_pose_.pose.position.z;
+
+        double err_x = std::abs(px - real_x);
+        double err_y = std::abs(py - real_y);
+        double err_z = std::abs(pz - real_z);
+
+        // 如果处于巡航阶段，累加误差用于最终计算 MAE
+        if (t >= (T_takeoff + T_accel) && t < (T_takeoff + T_accel + T_cruise)) {
+            sum_error_x_ += err_x;
+            sum_error_y_ += err_y;
+            sum_error_z_ += err_z;
+            cruise_sample_count_++;
+        }
+
+        // 每 500 毫秒打印一次：时间 | 期望位置 | 真实位置 | 绝对误差
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(), 
+            *this->get_clock(), 
+            500, 
+            "⏱️ t:%5.1fs | SP[% .2f, % .2f, % .2f] | Real[% .2f, % .2f, % .2f] | Err[%.3f, %.3f, %.3f]", 
+            t, px, py, pz, real_x, real_y, real_z, err_x, err_y, err_z
+        );
+
         auto timestamp = this->get_clock()->now();
         msg.header.stamp = timestamp;
         msg.header.frame_id = "map";
@@ -288,15 +334,6 @@ private:
         // 发布预期轨迹给 RViz (仅在起飞后)
         expected_path_.header.stamp = timestamp;
         path_pub_->publish(expected_path_);
-
-// 🌟 新增：打印实时期望轨迹（每 500 毫秒打印一次，防止 100Hz 刷爆 Ubuntu 终端）
-        RCLCPP_INFO_THROTTLE(
-            this->get_logger(), 
-            *this->get_clock(), 
-            500, 
-            "🎯 Setpoint -> X: % .3f, Y: % .3f, Z: % .3f | Mode Time: % .2f s", 
-            px, py, pz, t
-        );
 
         time_step_++;
     }

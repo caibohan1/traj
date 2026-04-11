@@ -10,6 +10,7 @@
 #include <chrono>
 #include <algorithm>
 
+
 using namespace std::chrono_literals;
 
 class GeometricController : public rclcpp::Node
@@ -17,6 +18,9 @@ class GeometricController : public rclcpp::Node
 public:
     GeometricController() : Node("geometric_controller")
     {
+
+
+
         // --- Publishers ---
         att_sp_pub_ = this->create_publisher<mavros_msgs::msg::AttitudeTarget>("/mavros/setpoint_raw/attitude", 10);
 
@@ -46,7 +50,7 @@ public:
                 control_loop(); 
             });
         
-        RCLCPP_INFO(this->get_logger(), "Geometric Controller (MAVROS/ENU) Started.");
+        RCLCPP_INFO(this->get_logger(), "Geometric Controller (MAVROS/ENU) with Dual Integral Started.");
     }
 
 private:
@@ -68,7 +72,10 @@ private:
 
     uint64_t offboard_setpoint_counter_ = 0;
     
-    double integral_error_z_ = 0.0;
+    // 🌟 核心修改 1：独立定义三轴位置误差积分和速度误差积分
+    Eigen::Vector3d integral_error_p_{0.0, 0.0, 0.0}; 
+    Eigen::Vector3d integral_error_v_{0.0, 0.0, 0.0}; 
+    
     rclcpp::Time last_odom_timestamp_; 
 
     void control_loop()
@@ -117,25 +124,27 @@ private:
         }
     }
 
-void compute_and_publish_control()
+
+    void compute_and_publish_control()
     {
         const double m = 1.535; // kg 
         const double g = 9.81;  // m/s^2
         const double max_thrust = 25.1; // N
-        // 恢复到你原有的合理限幅 45 度
         const double max_tilt_angle = 45.0 * M_PI / 180.0; 
 
-        // 暂时保留阻力前馈，如果环境风不大，这段也可以置 0
+        // 空气阻力前馈
         Eigen::Matrix3d D;
         D << 0.25, 0.0,  0.0,
              0.0,  0.25, 0.0,
              0.0,  0.0,  0.0;
 
-        // 使用你原来的增益，既然起飞稳定说明增益基础是对的
-        Eigen::Matrix3d K_p = Eigen::Vector3d(3.0, 3.0, 8.0).asDiagonal();
+        // 🌟 核心修改 2：应用新架构的增益参数
+        Eigen::Matrix3d K_p = Eigen::Vector3d(6.0, 6.5, 8.0).asDiagonal();
         Eigen::Matrix3d K_v = Eigen::Vector3d(2.0, 2.0, 4.0).asDiagonal();
-        double K_i_z = 2.0;
-
+        
+        // 分别配置位置积分增益 (K_i_p) 和速度积分增益 (K_i_v)
+        Eigen::Matrix3d K_i_p = Eigen::Vector3d(0.2, 0.45, 2.0).asDiagonal(); 
+        Eigen::Matrix3d K_i_v = Eigen::Vector3d(0.5, 0.5, 2.0).asDiagonal();
         // ================= 1. 提取当前状态 =================
         // 位置在 ENU 世界坐标系
         Eigen::Vector3d p(current_odom_.pose.pose.position.x, current_odom_.pose.pose.position.y, current_odom_.pose.pose.position.z);
@@ -143,9 +152,8 @@ void compute_and_publish_control()
         Eigen::Quaterniond q(current_odom_.pose.pose.orientation.w, current_odom_.pose.pose.orientation.x, 
                              current_odom_.pose.pose.orientation.y, current_odom_.pose.pose.orientation.z);
 
-        // 【核心修复】：提取机体坐标系(FLU)下的线速度
+        // 提取机体坐标系(FLU)下的线速度，并用四元数将其旋转到世界坐标系(ENU)
         Eigen::Vector3d v_body(current_odom_.twist.twist.linear.x, current_odom_.twist.twist.linear.y, current_odom_.twist.twist.linear.z);
-        // 使用四元数将其旋转到世界坐标系(ENU)
         Eigen::Vector3d v = q * v_body; 
 
         // ================= 2. 提取期望状态 (ENU) =================
@@ -154,9 +162,9 @@ void compute_and_publish_control()
         Eigen::Vector3d a_d(current_setpoint_.acceleration_or_force.x, current_setpoint_.acceleration_or_force.y, current_setpoint_.acceleration_or_force.z);
         double yaw_d = current_setpoint_.yaw;
 
-        // ================= 3. 位置环计算 =================
+        // ================= 3. 误差计算与积分 =================
         Eigen::Vector3d e_p = p - p_d;
-        Eigen::Vector3d e_v = v - v_d; // 现在两边都是 ENU 坐标系了，相减成立！
+        Eigen::Vector3d e_v = v - v_d; 
         
         // 修复时间戳逻辑：使用消息自带的精确时间
         rclcpp::Time current_time = current_odom_.header.stamp;
@@ -167,15 +175,25 @@ void compute_and_publish_control()
         last_odom_timestamp_ = current_time;
         if (dt > 0.05 || dt <= 0.0) dt = 0.01; 
 
-        // Z 轴积分防饱和
-        integral_error_z_ += e_p.z() * dt;
-        integral_error_z_ = std::clamp(integral_error_z_, -3.0, 3.0); 
+        // 🌟 核心修改 3：双通道积分与严格防饱和限幅
+        
+        // 1. 位置误差积分
+        integral_error_p_ += e_p * dt;
+        integral_error_p_.x() = std::clamp(integral_error_p_.x(), -1.0, 1.0);
+        integral_error_p_.y() = std::clamp(integral_error_p_.y(), -1.0, 1.0);
+        integral_error_p_.z() = std::clamp(integral_error_p_.z(), -2.0, 2.0);
 
-        // 期望加速度
-        Eigen::Vector3d a_cmd = a_d - K_p * e_p - K_v * e_v;
-        a_cmd.z() -= K_i_z * integral_error_z_;
+        // 2. 速度误差积分
+        integral_error_v_ += e_v * dt;
+        integral_error_v_.x() = std::clamp(integral_error_v_.x(), -2.0, 2.0);
+        integral_error_v_.y() = std::clamp(integral_error_v_.y(), -2.0, 2.0);
+        integral_error_v_.z() = std::clamp(integral_error_v_.z(), -3.0, 3.0); 
 
-        // 在 ENU 中抵消向下的重力，需要加一个向上的加速度分量
+        // 🌟 核心修改 4：将积分项融入加速度指令中
+        Eigen::Vector3d a_cmd = a_d - K_p * e_p - K_v * e_v - K_i_p * integral_error_p_ - K_i_v * integral_error_v_;
+
+        // ================= 4. 推力映射 (ENU坐标系逻辑) =================
+        // ENU 坐标系重力向下为 -g，补偿需要向上的 +g
         Eigen::Vector3d e_3(0.0, 0.0, 1.0);
         Eigen::Vector3d T_vec_pre = m * (a_cmd + g * e_3);
 
@@ -188,9 +206,11 @@ void compute_and_publish_control()
         R_pre << x_b_pre, y_b_pre, z_b_pre;
 
         Eigen::Vector3d a_drag = R_pre * D * R_pre.transpose() * v_d;
+        
+        // 最终的推力向量 (包含了所有的加速度、重力补偿和空气阻力)
         Eigen::Vector3d T_vec = m * (a_cmd + g * e_3) + a_drag;
 
-        // ================= 4. 安全限幅 =================
+        // ================= 5. 安全限幅 =================
         if (T_vec.z() < 0.1) T_vec.z() = 0.1; 
         
         double current_tilt_cos = std::abs(T_vec.z()) / T_vec.norm();
@@ -203,7 +223,7 @@ void compute_and_publish_control()
 
         double T_norm = T_vec.norm();
 
-        // ================= 5. 几何映射 =================
+        // ================= 6. 几何映射 =================
         Eigen::Vector3d z_b_d = T_vec.normalized(); 
         Eigen::Vector3d y_b_d = z_b_d.cross(x_c).normalized();
         Eigen::Vector3d x_b_d = y_b_d.cross(z_b_d);
@@ -235,7 +255,7 @@ void compute_and_publish_control()
 
         att_sp_pub_->publish(msg);
 
-        // 🌟 新增：打印期望姿态四元数和发送给 MAVROS 的标量推力（每 500 毫秒打印一次）
+        // 打印期望姿态四元数和发送给 MAVROS 的标量推力
         RCLCPP_INFO_THROTTLE(
             this->get_logger(),
             *this->get_clock(),

@@ -1,9 +1,8 @@
 #include <rclcpp/rclcpp.hpp>
-#include <px4_msgs/msg/trajectory_setpoint.hpp>
-#include <px4_msgs/msg/offboard_control_mode.hpp> 
-#include <px4_msgs/msg/vehicle_command.hpp>       
-#include <px4_msgs/msg/vehicle_status.hpp>
-#include <px4_msgs/msg/vehicle_odometry.hpp>
+#include <mavros_msgs/msg/position_target.hpp>
+#include <mavros_msgs/msg/state.hpp>
+#include <mavros_msgs/srv/command_bool.hpp>
+#include <mavros_msgs/srv/set_mode.hpp>
 #include <nav_msgs/msg/path.hpp>                 
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>   
@@ -12,49 +11,47 @@
 
 using namespace std::chrono_literals;
 
-class Px4AutoFigure8 : public rclcpp::Node
+class MavrosAutoFigure8 : public rclcpp::Node
 {
 public:
-    Px4AutoFigure8() : Node("px4_auto_figure8")
+    MavrosAutoFigure8() : Node("mavros_auto_figure8")
     {
         // ================= 发布者 =================
-        setpoint_pub_ = this->create_publisher<px4_msgs::msg::TrajectorySetpoint>(
-            "/fmu/in/trajectory_setpoint", 10);
+        setpoint_pub_ = this->create_publisher<mavros_msgs::msg::PositionTarget>(
+            "/mavros/setpoint_raw/local", 10);
             
-        offboard_control_mode_pub_ = this->create_publisher<px4_msgs::msg::OffboardControlMode>(
-            "/fmu/in/offboard_control_mode", 10);
-            
-        vehicle_command_pub_ = this->create_publisher<px4_msgs::msg::VehicleCommand>(
-            "/fmu/in/vehicle_command", 10);
-
         path_pub_ = this->create_publisher<nav_msgs::msg::Path>(
-            "/px4_offboard/expected_path", 10);
+            "/mavros_offboard/expected_path", 10);
 
-        // 误差发布者
         error_pub_ = this->create_publisher<geometry_msgs::msg::PointStamped>(
-            "/px4_offboard/position_error", 10);
+            "/mavros_offboard/position_error", 10);
+
+        // ================= 服务客户端 =================
+        arming_client_ = this->create_client<mavros_msgs::srv::CommandBool>("/mavros/cmd/arming");
+        set_mode_client_ = this->create_client<mavros_msgs::srv::SetMode>("/mavros/set_mode");
 
         // ================= 订阅者 =================
-        vehicle_status_sub_ = this->create_subscription<px4_msgs::msg::VehicleStatus>(
-            "/fmu/out/vehicle_status_v1", rclcpp::QoS(10).best_effort(), 
-            [this](const px4_msgs::msg::VehicleStatus::SharedPtr msg) {
-                is_armed_ = (msg->arming_state == px4_msgs::msg::VehicleStatus::ARMING_STATE_ARMED);
-                is_offboard_ = (msg->nav_state == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD);
+        state_sub_ = this->create_subscription<mavros_msgs::msg::State>(
+            "/mavros/state", rclcpp::QoS(10).best_effort(), 
+            [this](const mavros_msgs::msg::State::SharedPtr msg) {
+                is_armed_ = msg->armed;
+                is_offboard_ = (msg->mode == "OFFBOARD");
             });
 
-        odom_sub_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>(
-            "/fmu/out/vehicle_odometry", rclcpp::QoS(10).best_effort(),
-            [this](const px4_msgs::msg::VehicleOdometry::SharedPtr msg) {
+        pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+            "/mavros/local_position/pose", rclcpp::QoS(10).best_effort(),
+            [this](const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
                 
-                current_odom_ = *msg; 
+                current_pose_ = *msg; 
 
-                if (!has_odom_) {
-                    start_x_ = msg->position[0];
-                    start_y_ = msg->position[1];
-                    start_z_ = msg->position[2];
-                    double q_w = msg->q[0], q_x = msg->q[1], q_y = msg->q[2], q_z = msg->q[3];
+                if (!has_pose_) {
+                    start_x_ = msg->pose.position.x;
+                    start_y_ = msg->pose.position.y;
+                    start_z_ = msg->pose.position.z;
+                    double q_w = msg->pose.orientation.w, q_x = msg->pose.orientation.x;
+                    double q_y = msg->pose.orientation.y, q_z = msg->pose.orientation.z;
                     start_yaw_ = std::atan2(2.0 * (q_w * q_z + q_x * q_y), 1.0 - 2.0 * (q_y * q_y + q_z * q_z));
-                    has_odom_ = true;
+                    has_pose_ = true;
                     
                     RCLCPP_INFO(this->get_logger(), "📍 Initial Pose Locked! X:%.2f, Y:%.2f, Yaw:%.2f rad", start_x_, start_y_, start_yaw_);
                     
@@ -66,26 +63,27 @@ public:
         offboard_setpoint_counter_ = 0;
 
         timer_ = this->create_wall_timer(
-            10ms, std::bind(&Px4AutoFigure8::timer_callback, this));
+            10ms, std::bind(&MavrosAutoFigure8::timer_callback, this));
             
-        RCLCPP_INFO(this->get_logger(), "🚀 Auto-Takeoff Figure-8 Node (With Error Tracking) Started. Connecting to PX4...");
+        RCLCPP_INFO(this->get_logger(), "🚀 Auto-Takeoff Figure-8 Node (MAVROS) Started. Connecting...");
     }
 
 private:
-    rclcpp::Publisher<px4_msgs::msg::TrajectorySetpoint>::SharedPtr setpoint_pub_;
-    rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr offboard_control_mode_pub_;
-    rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr vehicle_command_pub_;
+    rclcpp::Publisher<mavros_msgs::msg::PositionTarget>::SharedPtr setpoint_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_; 
     rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr error_pub_; 
     
-    rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr vehicle_status_sub_;
-    rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr odom_sub_;
+    rclcpp::Client<mavros_msgs::srv::CommandBool>::SharedPtr arming_client_;
+    rclcpp::Client<mavros_msgs::srv::SetMode>::SharedPtr set_mode_client_;
+
+    rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr state_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
     
     rclcpp::TimerBase::SharedPtr timer_;
 
-    px4_msgs::msg::VehicleOdometry current_odom_;
+    geometry_msgs::msg::PoseStamped current_pose_;
 
-    bool has_odom_ = false;
+    bool has_pose_ = false;
     bool is_armed_ = false;
     bool is_offboard_ = false;
     bool trajectory_started_ = false;
@@ -96,7 +94,7 @@ private:
 
     nav_msgs::msg::Path expected_path_; 
 
-    // 🌟 新增：用于累计“盘旋阶段”误差的变量
+    // 🌟 统计变量
     double sum_error_x_ = 0.0;
     double sum_error_y_ = 0.0;
     double sum_error_z_ = 0.0;
@@ -106,8 +104,8 @@ private:
     {
         double A = 2.0;  
         double B = 1.0;  
-        double omega_max = 0.25; 
-        double target_z = -1.8; 
+        double omega_max = 1.8; 
+        double target_z = 1.8; // MAVROS (ENU) 向上为正
         
         expected_path_.header.frame_id = "map"; 
         expected_path_.poses.clear();
@@ -122,48 +120,24 @@ private:
         }
     }
 
-    void publish_offboard_control_mode() {
-        px4_msgs::msg::OffboardControlMode msg{};
-        msg.position = true;
-        msg.velocity = true;
-        msg.acceleration = true;
-        msg.attitude = false;
-        msg.body_rate = false;
-        msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
-        offboard_control_mode_pub_->publish(msg);
-    }
-
-    void publish_vehicle_command(uint16_t command, float param1 = 0.0, float param2 = 0.0) {
-        px4_msgs::msg::VehicleCommand msg{};
-        msg.param1 = param1;
-        msg.param2 = param2;
-        msg.command = command;
-        msg.target_system = 1;
-        msg.target_component = 1;
-        msg.source_system = 1;
-        msg.source_component = 1;
-        msg.from_external = true;
-        msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
-        vehicle_command_pub_->publish(msg);
-    }
-
     void timer_callback()
     {
-        if (!has_odom_) return;
+        if (!has_pose_) return;
 
-        publish_offboard_control_mode();
-
-        px4_msgs::msg::TrajectorySetpoint msg{};
+        mavros_msgs::msg::PositionTarget msg{};
         auto timestamp = this->get_clock()->now();
-        msg.timestamp = timestamp.nanoseconds() / 1000;
+        msg.header.stamp = timestamp;
+        msg.header.frame_id = "map";
+        msg.coordinate_frame = mavros_msgs::msg::PositionTarget::FRAME_LOCAL_NED; // 通常MAVROS默认这个框架
+        msg.type_mask = 0; // 启用位置、速度、加速度和 Yaw 控制
 
         // ================= 状态机：自动解锁与切模式 =================
         if (!trajectory_started_) {
-            msg.position = {(float)start_x_, (float)start_y_, (float)start_z_};
-            msg.yaw = (float)start_yaw_;
-            msg.velocity = {0.0, 0.0, 0.0};
-            msg.acceleration = {0.0, 0.0, 0.0};
-            msg.yawspeed = 0.0;
+            msg.position.x = start_x_;
+            msg.position.y = start_y_;
+            msg.position.z = start_z_;
+            msg.yaw = start_yaw_;
+            
             setpoint_pub_->publish(msg);
 
             geometry_msgs::msg::PointStamped error_msg;
@@ -176,13 +150,26 @@ private:
 
             if (offboard_setpoint_counter_ == 100) {
                 RCLCPP_INFO(this->get_logger(), "Sending Offboard & Arm commands...");
-                publish_vehicle_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1, 6);
-                publish_vehicle_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0);
+                auto mode_cmd = std::make_shared<mavros_msgs::srv::SetMode::Request>();
+                mode_cmd->custom_mode = "OFFBOARD";
+                set_mode_client_->async_send_request(mode_cmd);
+
+                auto arm_cmd = std::make_shared<mavros_msgs::srv::CommandBool::Request>();
+                arm_cmd->value = true;
+                arming_client_->async_send_request(arm_cmd);
             }
 
             if (offboard_setpoint_counter_ > 100 && offboard_setpoint_counter_ % 100 == 0) {
-                if (!is_offboard_) publish_vehicle_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1, 6);
-                if (!is_armed_) publish_vehicle_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0);
+                if (!is_offboard_) {
+                    auto mode_cmd = std::make_shared<mavros_msgs::srv::SetMode::Request>();
+                    mode_cmd->custom_mode = "OFFBOARD";
+                    set_mode_client_->async_send_request(mode_cmd);
+                }
+                if (!is_armed_) {
+                    auto arm_cmd = std::make_shared<mavros_msgs::srv::CommandBool::Request>();
+                    arm_cmd->value = true;
+                    arming_client_->async_send_request(arm_cmd);
+                }
             }
 
             if (is_armed_ && is_offboard_) {
@@ -199,8 +186,8 @@ private:
         
         const double A = 2.0;        
         const double B = 1.0;        
-        const double omega_max = 0.25;   
-        const double target_z = -1.8;     
+        const double omega_max = 1.8;   
+        const double target_z = 1.8; // ENU  
         
         const double T_takeoff = 5.0; 
         const double T_land    = 5.0; 
@@ -226,7 +213,7 @@ private:
                 double mae_z = sum_error_z_ / cruise_sample_count_;
                 
                 RCLCPP_INFO(this->get_logger(), "==================================================");
-                RCLCPP_INFO(this->get_logger(), "📊 PX4 原生串级 - 【盘旋阶段】跟踪性能评估 (MAE):");
+                RCLCPP_INFO(this->get_logger(), "📊 MAVROS 串级 - 【盘旋阶段】跟踪性能评估 (MAE):");
                 RCLCPP_INFO(this->get_logger(), "   👉 采集样本数: %lu", cruise_sample_count_);
                 RCLCPP_INFO(this->get_logger(), "   👉 X轴平均误差: %.4f m", mae_x);
                 RCLCPP_INFO(this->get_logger(), "   👉 Y轴平均误差: %.4f m", mae_y);
@@ -235,7 +222,11 @@ private:
             }
 
             RCLCPP_INFO(this->get_logger(), "🏁 Mission Accomplished. Disarming and shutting down...");
-            publish_vehicle_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0); 
+            
+            auto arm_cmd = std::make_shared<mavros_msgs::srv::CommandBool::Request>();
+            arm_cmd->value = false;
+            arming_client_->async_send_request(arm_cmd);
+            
             rclcpp::shutdown(); 
             return; 
         }
@@ -308,29 +299,28 @@ private:
         double ax = A * (alpha * c1 - std::pow(omega, 2) * s1);
         double ay = 2.0 * B * (alpha * c2 - 2.0 * std::pow(omega, 2) * s2);
 
-        msg.position = {(float)px, (float)py, (float)pz};
-        msg.velocity = {(float)vx, (float)vy, (float)vz};
-        msg.acceleration = {(float)ax, (float)ay, (float)az};
+        msg.position.x = px; msg.position.y = py; msg.position.z = pz;
+        msg.velocity.x = vx; msg.velocity.y = vy; msg.velocity.z = vz;
+        msg.acceleration_or_force.x = ax; msg.acceleration_or_force.y = ay; msg.acceleration_or_force.z = az;
 
-        msg.yaw = (float)start_yaw_; 
-        msg.yawspeed = 0.0;          
+        msg.yaw = start_yaw_; 
 
         setpoint_pub_->publish(msg);
 
         expected_path_.header.stamp = timestamp;
         path_pub_->publish(expected_path_);
 
-        // 计算并发布实时位置误差 (真实位置 - 期望位置)
+        // 计算并发布实时位置误差
         geometry_msgs::msg::PointStamped error_msg;
         error_msg.header.stamp = timestamp;
         error_msg.header.frame_id = "map"; 
         
-        if (has_odom_) {
-            error_msg.point.x = current_odom_.position[0] - px;
-            error_msg.point.y = current_odom_.position[1] - py;
-            error_msg.point.z = current_odom_.position[2] - pz;
+        if (has_pose_) {
+            error_msg.point.x = current_pose_.pose.position.x - px;
+            error_msg.point.y = current_pose_.pose.position.y - py;
+            error_msg.point.z = current_pose_.pose.position.z - pz;
 
-            // 🌟 仅在盘旋（Cruise）阶段统计平均绝对误差
+            // 🌟 仅在盘旋阶段统计平均绝对误差
             if (t >= T_takeoff + T_accel && t < T_takeoff + T_accel + T_cruise) {
                 sum_error_x_ += std::abs(error_msg.point.x);
                 sum_error_y_ += std::abs(error_msg.point.y);
@@ -344,7 +334,7 @@ private:
             this->get_logger(), 
             *this->get_clock(), 
             500, 
-            "🎯 PX4 Tracking -> X: % .3f, Y: % .3f, Z: % .3f | Err(X:%.2f, Y:%.2f) | Mode Time: % .2f s", 
+            "🎯 MAVROS Tracking -> X: % .3f, Y: % .3f, Z: % .3f | Err(X:%.2f, Y:%.2f) | Mode Time: % .2f s", 
             px, py, pz, error_msg.point.x, error_msg.point.y, t
         );
 
@@ -355,7 +345,7 @@ private:
 int main(int argc, char *argv[])
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<Px4AutoFigure8>());
+    rclcpp::spin(std::make_shared<MavrosAutoFigure8>());
     rclcpp::shutdown();
     return 0;
 }

@@ -17,6 +17,7 @@ find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(mavros_msgs REQUIRED)
+find_package(rcl_interfaces REQUIRED) # 显式声明接口包
 
 # 包含 Eigen 头文件
 include_directories(${EIGEN3_INCLUDE_DIRS})
@@ -35,7 +36,7 @@ ament_target_dependencies(eight_planner rclcpp px4_msgs nav_msgs geometry_msgs s
 
 # 1. 添加控制器节点
 add_executable(controller_node src/Controller.cpp)
-ament_target_dependencies(controller_node rclcpp px4_msgs Eigen3 std_msgs)
+ament_target_dependencies(controller_node rclcpp px4_msgs Eigen3 std_msgs rcl_interfaces)
 
 # mav轨迹规划器节点
 add_executable(mavcircle_planner src/Mav_circlecontrol.cpp)
@@ -84,6 +85,24 @@ ament_target_dependencies(px4_eight_trajectory
   geometry_msgs
 )
 
+add_executable(px4_mavcircle src/px4_mavcircle.cpp)
+ament_target_dependencies(px4_mavcircle
+  rclcpp
+  std_msgs
+  geometry_msgs
+  nav_msgs
+  mavros_msgs
+)
+
+add_executable(px4_maveight src/px4_maveight.cpp)
+ament_target_dependencies(px4_maveight
+  rclcpp
+  std_msgs
+  geometry_msgs
+  nav_msgs
+  mavros_msgs
+)
+
 add_executable(ratecontrol src/ratecontrol.cpp)
 ament_target_dependencies(ratecontrol
   rclcpp
@@ -112,6 +131,36 @@ ament_target_dependencies(ratecircle
   geometry_msgs
 )
 
+add_executable(ratemavcircle src/ratemavcircle.cpp)
+
+# 链接目标依赖
+ament_target_dependencies(ratemavcircle
+  rclcpp
+  px4_msgs
+  nav_msgs
+  mavros_msgs
+)
+
+add_executable(ratemavcontrol src/ratemavcontrol.cpp)
+
+# 链接目标依赖
+ament_target_dependencies(ratemavcontrol
+  rclcpp
+  px4_msgs
+  nav_msgs
+  mavros_msgs
+)
+
+add_executable(ratemaveight src/ratemaveight.cpp)
+
+# 链接目标依赖
+ament_target_dependencies(ratemaveight
+  rclcpp
+  px4_msgs
+  nav_msgs
+  mavros_msgs
+)
+
 target_link_libraries(geometric_controller Eigen3::Eigen) # 链接 Eigen3
 # 安装可执行文件
 install(TARGETS
@@ -124,10 +173,20 @@ install(TARGETS
   mavController
   px4_circle_trajectory
   px4_eight_trajectory
+  px4_mavcircle
+  px4_maveight
   ratecontrol
   rateeight
   ratecircle
+  ratemavcircle
+  ratemavcontrol
+  ratemaveight
   DESTINATION lib/${PROJECT_NAME}
 )
-
+# 🌟 核心新增：告诉 CMake 把 config 和 launch 文件夹打包带走
+install(DIRECTORY
+  launch
+  config
+  DESTINATION share/${PROJECT_NAME}
+)
 ament_package()

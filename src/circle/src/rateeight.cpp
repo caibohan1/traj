@@ -61,7 +61,7 @@ public:
         timer_ = this->create_wall_timer(
             10ms, std::bind(&TrajectoryPlanner::timer_callback, this));
             
-        RCLCPP_INFO(this->get_logger(), "Hardcore Figure-8 Planner (Fixed Yaw Edition) Started. Waiting for Geometric Controller to Arm...");
+        RCLCPP_INFO(this->get_logger(), "Hardcore Figure-8 Planner (PX4 Edition with Error Logging) Started. Waiting for Geometric Controller to Arm...");
     }
 
 private:
@@ -82,6 +82,12 @@ private:
     
     // 全局相角积分器
     double current_theta_ = 0.0;
+
+    // 🌟 MAE 误差统计变量
+    double sum_error_x_ = 0.0;
+    double sum_error_y_ = 0.0;
+    double sum_error_z_ = 0.0;
+    uint64_t cruise_sample_count_ = 0;
 
     void init_visual_path()
     {
@@ -133,7 +139,7 @@ private:
         // --- 核心物理参数 ---
         const double A = 2.0;        
         const double B = 1.0;        
-        const double omega_max = 0.25; // 高速大机动角速度
+        const double omega_max = 1.8; // 高速大机动角速度
         const double target_z = -1.8;  // 飞行高度
         
         const double T_takeoff = 5.0; 
@@ -149,7 +155,18 @@ private:
         const double T_total = T_takeoff + T_accel + T_cruise + T_decel + T_land;
         const double T_wait_after_land = 3.0; 
         
+        // ================= 任务结束打印统计结果 =================
         if (t > T_total + T_wait_after_land) {
+            if (cruise_sample_count_ > 0) {
+                double mae_x = sum_error_x_ / cruise_sample_count_;
+                double mae_y = sum_error_y_ / cruise_sample_count_;
+                double mae_z = sum_error_z_ / cruise_sample_count_;
+                
+                RCLCPP_INFO(this->get_logger(), "==================================================");
+                RCLCPP_INFO(this->get_logger(), "📊 PX4 几何控制 - 【盘旋阶段】 MAE评估:");
+                RCLCPP_INFO(this->get_logger(), "   X: %.4f m | Y: %.4f m | Z: %.4f m", mae_x, mae_y, mae_z);
+                RCLCPP_INFO(this->get_logger(), "==================================================");
+            }
             RCLCPP_INFO(this->get_logger(), "🏁 Planner Finished. Waiting for Geometric Controller to Disarm...");
             rclcpp::shutdown(); 
             return; 
@@ -160,61 +177,48 @@ private:
 
         // ================= 五段式柔性状态机 =================
         if (t < T_takeoff) {
-            // 1. 垂直平滑起飞
             double tau = t / T_takeoff;
             double tau2 = tau*tau, tau3 = tau2*tau, tau4 = tau3*tau, tau5 = tau4*tau;
-            
             double S = 10.0*tau3 - 15.0*tau4 + 6.0*tau5;
             double dS = (1.0/T_takeoff) * (30.0*tau2 - 60.0*tau3 + 30.0*tau4);
             double ddS = (1.0/std::pow(T_takeoff, 2)) * (60.0*tau - 180.0*tau2 + 120.0*tau3);
             double dddS = (1.0/std::pow(T_takeoff, 3)) * (60.0 - 360.0*tau + 360.0*tau2);
-
             pz = target_z * S; vz = target_z * dS; az = target_z * ddS; jz = target_z * dddS;
         } 
         else if (t < T_takeoff + T_accel) {
-            // 2. 水平相角柔性加速
             double tau = (t - T_takeoff) / T_accel;
             double tau2 = tau*tau, tau3 = tau2*tau, tau4 = tau3*tau, tau5 = tau4*tau;
-            
             double S = 10.0*tau3 - 15.0*tau4 + 6.0*tau5;
             double dS = (1.0/T_accel) * (30.0*tau2 - 60.0*tau3 + 30.0*tau4);
             double ddS = (1.0/std::pow(T_accel, 2)) * (60.0*tau - 180.0*tau2 + 120.0*tau3);
-
             pz = target_z; vz = 0; az = 0; jz = 0;
             omega = omega_max * S; alpha = omega_max * dS; gamma = omega_max * ddS;
         } 
         else if (t < T_takeoff + T_accel + T_cruise) {
-            // 3. 恒速巡航
             pz = target_z; vz = 0; az = 0; jz = 0;
             omega = omega_max; alpha = 0; gamma = 0;
         } 
         else if (t < T_takeoff + T_accel + T_cruise + T_decel) {
-            // 4. 水平相角柔性减速
             double tau = (t - T_takeoff - T_accel - T_cruise) / T_decel;
             double tau2 = tau*tau, tau3 = tau2*tau, tau4 = tau3*tau, tau5 = tau4*tau;
-            
             double S = 10.0*tau3 - 15.0*tau4 + 6.0*tau5;
             double dS = (1.0/T_decel) * (30.0*tau2 - 60.0*tau3 + 30.0*tau4);
             double ddS = (1.0/std::pow(T_decel, 2)) * (60.0*tau - 180.0*tau2 + 120.0*tau3);
-
             pz = target_z; vz = 0; az = 0; jz = 0;
             omega = omega_max * (1.0 - S); alpha = -omega_max * dS; gamma = -omega_max * ddS;
         } 
         else if (t < T_total) {
-            // 5. 垂直平滑降落
             double tau = (t - T_takeoff - T_accel - T_cruise - T_decel) / T_land;
             double tau2 = tau*tau, tau3 = tau2*tau, tau4 = tau3*tau, tau5 = tau4*tau;
-            
             double S = 10.0*tau3 - 15.0*tau4 + 6.0*tau5;
             double dS = (1.0/T_land) * (30.0*tau2 - 60.0*tau3 + 30.0*tau4);
             double ddS = (1.0/std::pow(T_land, 2)) * (60.0*tau - 180.0*tau2 + 120.0*tau3);
             double dddS = (1.0/std::pow(T_land, 3)) * (60.0 - 360.0*tau + 360.0*tau2);
-
             pz = target_z * (1.0 - S); vz = -target_z * dS; az = -target_z * ddS; jz = -target_z * dddS;
             omega = 0; alpha = 0; gamma = 0;
         }
 
-        // ================= 精确的 8 字形参数映射 (至三阶导数 Jerk) =================
+        // ================= 精确的 8 字形参数映射 =================
         current_theta_ += omega * 0.01;
         double th = current_theta_;
         double c1 = std::cos(th), s1 = std::sin(th);
@@ -224,25 +228,52 @@ private:
         double px = A * s1;
         double py = B * s2;
 
-        // 2. 速度 (一阶导)
+        // 2. 速度
         double vx = A * c1 * omega;
         double vy = 2.0 * B * c2 * omega;
 
-        // 3. 加速度 (二阶导)
+        // 3. 加速度
         double ax = A * (alpha * c1 - std::pow(omega, 2) * s1);
         double ay = 2.0 * B * (alpha * c2 - 2.0 * std::pow(omega, 2) * s2);
 
-        // 4. 加加速度 Jerk (三阶导) - 🌟 几何控制器最依赖的参数！
+        // 4. 加加速度 Jerk
         double jx = A * (gamma * c1 - 3.0 * alpha * omega * s1 - std::pow(omega, 3) * c1);
         double jy = 2.0 * B * (gamma * c2 - 6.0 * alpha * omega * s2 - 4.0 * std::pow(omega, 3) * c2);
 
-        // 叠加原点偏移量
-        msg.position = {(float)(start_x_ + px), (float)(start_y_ + py), (float)(start_z_ + pz)};
+        // 计算带起飞原点偏移的期望绝对位置
+        double target_px = start_x_ + px;
+        double target_py = start_y_ + py;
+        double target_pz = start_z_ + pz;
+
+        // 🌟 实时误差计算与累加
+        double real_x = current_odom_.position[0];
+        double real_y = current_odom_.position[1];
+        double real_z = current_odom_.position[2];
+
+        double err_x = std::abs(target_px - real_x);
+        double err_y = std::abs(target_py - real_y);
+        double err_z = std::abs(target_pz - real_z);
+
+        if (t >= (T_takeoff + T_accel) && t < (T_takeoff + T_accel + T_cruise)) {
+            sum_error_x_ += err_x;
+            sum_error_y_ += err_y;
+            sum_error_z_ += err_z;
+            cruise_sample_count_++;
+        }
+
+        // 实时终端打印对比
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(), *this->get_clock(), 500, 
+            "⏱️ t: %4.1f s | SP[% .2f, % .2f, % .2f] | Real[% .2f, % .2f, % .2f] | Err[%.3f, %.3f, %.3f]", 
+            t, target_px, target_py, target_pz, real_x, real_y, real_z, err_x, err_y, err_z
+        );
+
+        // 叠加原点偏移量并打包发送
+        msg.position = {(float)target_px, (float)target_py, (float)target_pz};
         msg.velocity = {(float)vx, (float)vy, (float)vz};
         msg.acceleration = {(float)ax, (float)ay, (float)az};
         msg.jerk = {(float)jx, (float)jy, (float)jz};
 
-        // 🌟 ================= 偏航角始终锁定为起飞朝向 ================= 🌟
         msg.yaw = (float)start_yaw_;
         msg.yawspeed = 0.0f;
 

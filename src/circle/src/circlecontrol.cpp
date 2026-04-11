@@ -31,7 +31,7 @@ public:
 
                 if (is_armed && is_offboard && !trajectory_started_) {
                     if (has_odom_) {
-                        // 🌟 核心：在切入 Offboard 瞬间，锁定当前物理坐标作为相对起点！
+                        // 锁定当前物理坐标作为相对起点
                         start_x_ = current_odom_.position[0];
                         start_y_ = current_odom_.position[1];
                         start_z_ = current_odom_.position[2];
@@ -60,7 +60,7 @@ public:
         timer_ = this->create_wall_timer(
             10ms, std::bind(&TrajectoryPlanner::timer_callback, this));
             
-        RCLCPP_INFO(this->get_logger(), "Clean Decoupled Z-XY-Z Trajectory Planner Started.");
+        RCLCPP_INFO(this->get_logger(), "Trajectory Planner (Exact Jerk & Error Logging) Started.");
     }
 
 private:
@@ -81,10 +81,16 @@ private:
     nav_msgs::msg::Path expected_path_; 
     uint64_t time_step_;
 
+    // 统计巡航阶段误差
+    double sum_error_x_ = 0.0;
+    double sum_error_y_ = 0.0;
+    double sum_error_z_ = 0.0;
+    uint64_t cruise_sample_count_ = 0;
+
     void init_visual_path()
     {
-        double R = 0.5;
-        double omega_max = 1; 
+        double R = 1.0;
+        double omega_max = 0.628; 
         expected_path_.header.frame_id = "map"; 
         
         double T = 2.0 * M_PI / omega_max; 
@@ -92,7 +98,7 @@ private:
             geometry_msgs::msg::PoseStamped pose;
             pose.pose.position.x = R * std::sin(omega_max * t);
             pose.pose.position.y = R - R * std::cos(omega_max * t); 
-            pose.pose.position.z = -5.0; 
+            pose.pose.position.z = -1.8; 
             expected_path_.poses.push_back(pose);
         }
     }
@@ -130,8 +136,8 @@ private:
         double t = static_cast<double>(time_step_) * 0.01; 
         
         // ================= 核心物理参数 =================
-        const double R = 0.5;        
-        const double omega_max = 1;   
+        const double R = 1.0;        
+        const double omega_max = 0.628;   
         const double target_z = -1.8;     
         
         const double T_takeoff = 5.0; 
@@ -148,7 +154,21 @@ private:
         const double T_total = T_takeoff + T_accel + T_cruise + T_decel + T_land;
         const double T_wait_after_land = 3.0; 
         
+        // ================= 任务结束与 MAE 打印 =================
         if (t > T_total + T_wait_after_land) {
+            if (cruise_sample_count_ > 0) {
+                double mae_x = sum_error_x_ / cruise_sample_count_;
+                double mae_y = sum_error_y_ / cruise_sample_count_;
+                double mae_z = sum_error_z_ / cruise_sample_count_;
+                
+                RCLCPP_INFO(this->get_logger(), "==================================================");
+                RCLCPP_INFO(this->get_logger(), "📊 Cruise Phase Tracking Error Summary (MAE):");
+                RCLCPP_INFO(this->get_logger(), "   Mean Absolute Error X: %.4f m", mae_x);
+                RCLCPP_INFO(this->get_logger(), "   Mean Absolute Error Y: %.4f m", mae_y);
+                RCLCPP_INFO(this->get_logger(), "   Mean Absolute Error Z: %.4f m", mae_z);
+                RCLCPP_INFO(this->get_logger(), "   Total Samples Evaluated: %lu", cruise_sample_count_);
+                RCLCPP_INFO(this->get_logger(), "==================================================");
+            }
             RCLCPP_INFO(this->get_logger(), "Mission Accomplished. Shutting down Planner...");
             rclcpp::shutdown(); 
             return; 
@@ -193,9 +213,7 @@ private:
         } 
         else if (t < T_takeoff + T_accel + T_cruise) {
             double t_loc = t - T_takeoff - T_accel;
-            
             pz = target_z; vz = 0; az = 0; 
-            
             omega = omega_max; alpha = 0; 
             theta = (circles_accel * 2.0 * M_PI) + (omega_max * t_loc);
         } 
@@ -261,6 +279,30 @@ private:
         msg.yaw = (float)start_yaw_; 
         msg.yawspeed = 0.0;          
 
+        // ================= 🌟 实时位置与误差计算打印 =================
+        double real_x = current_odom_.position[0];
+        double real_y = current_odom_.position[1];
+        double real_z = current_odom_.position[2];
+
+        double err_x = std::abs(px - real_x);
+        double err_y = std::abs(py - real_y);
+        double err_z = std::abs(pz - real_z);
+
+        if (t >= (T_takeoff + T_accel) && t < (T_takeoff + T_accel + T_cruise)) {
+            sum_error_x_ += err_x;
+            sum_error_y_ += err_y;
+            sum_error_z_ += err_z;
+            cruise_sample_count_++;
+        }
+
+        RCLCPP_INFO_THROTTLE(
+            this->get_logger(), 
+            *this->get_clock(), 
+            500, 
+            "⏱️ t:%5.1fs | SP[% .2f, % .2f, % .2f] | Real[% .2f, % .2f, % .2f] | Err[%.3f, %.3f, %.3f]", 
+            t, px, py, pz, real_x, real_y, real_z, err_x, err_y, err_z
+        );
+
         // ================= 发送数据 =================
         auto timestamp = this->get_clock()->now();
         msg.timestamp = timestamp.nanoseconds() / 1000;
@@ -268,15 +310,6 @@ private:
 
         expected_path_.header.stamp = timestamp;
         path_pub_->publish(expected_path_);
-
-// 🌟 新增：打印实时期望轨迹（每 500 毫秒打印一次，防止 100Hz 刷爆 Ubuntu 终端）
-        RCLCPP_INFO_THROTTLE(
-            this->get_logger(), 
-            *this->get_clock(), 
-            500, 
-            "🎯 Setpoint -> X: % .3f, Y: % .3f, Z: % .3f | Mode Time: % .2f s", 
-            px, py, pz, t
-        );
 
         time_step_++;
     }

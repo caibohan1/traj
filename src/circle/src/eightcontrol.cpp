@@ -2,6 +2,7 @@
 #include <px4_msgs/msg/trajectory_setpoint.hpp>
 #include <nav_msgs/msg/path.hpp>                 
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/point_stamped.hpp>   
 #include <chrono>
 #include <cmath>
 #include <px4_msgs/msg/vehicle_status.hpp>
@@ -20,6 +21,9 @@ public:
         path_pub_ = this->create_publisher<nav_msgs::msg::Path>(
             "/geometric_controller/expected_path", 10);
 
+        error_pub_ = this->create_publisher<geometry_msgs::msg::PointStamped>(
+            "/geometric_controller/position_error", 10);
+
         // ================= 监听飞控底层状态 =================
         vehicle_status_sub_ = this->create_subscription<px4_msgs::msg::VehicleStatus>(
             "/fmu/out/vehicle_status_v1", 
@@ -31,7 +35,6 @@ public:
 
                 if (is_armed && is_offboard && !trajectory_started_) {
                     if (has_odom_) {
-                        // 🌟 核心：在切入 Offboard 瞬间，锁定当前物理坐标作为相对起点！
                         start_x_ = current_odom_.position[0];
                         start_y_ = current_odom_.position[1];
                         start_z_ = current_odom_.position[2];
@@ -41,7 +44,6 @@ public:
                         RCLCPP_INFO(this->get_logger(), "🚀 Offboard & Armed confirmed! Taking off...");
                         trajectory_started_ = true;
                         
-                        // 锁定起点后再生成 RViz 视觉轨迹
                         init_visual_path();
                     }
                 }
@@ -62,12 +64,14 @@ public:
         timer_ = this->create_wall_timer(
             10ms, std::bind(&TrajectoryPlanner::timer_callback, this));
             
-        RCLCPP_INFO(this->get_logger(), "Clean Decoupled Figure-8 Planner (High-Speed) Started.");
+        RCLCPP_INFO(this->get_logger(), "Clean Decoupled Figure-8 Planner (High-Speed + Error Tracking) Started.");
     }
 
 private:
     rclcpp::Publisher<px4_msgs::msg::TrajectorySetpoint>::SharedPtr setpoint_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_; 
+    rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr error_pub_; 
+    
     rclcpp::TimerBase::SharedPtr timer_;
 
     rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr vehicle_status_sub_;
@@ -84,21 +88,25 @@ private:
     nav_msgs::msg::Path expected_path_; 
     uint64_t time_step_;
 
+    // 🌟 新增：用于累计“盘旋阶段”误差的变量
+    double sum_error_x_ = 0.0;
+    double sum_error_y_ = 0.0;
+    double sum_error_z_ = 0.0;
+    uint64_t cruise_sample_count_ = 0;
+
     void init_visual_path()
     {
         double A = 2.0;  
         double B = 1.0;  
-        double omega_max = 0.25; 
-        double target_z = -1.8; // NED高度为负
+        double omega_max = 0.314; 
+        double target_z = -1.8; 
         
         expected_path_.header.frame_id = "map"; 
         expected_path_.poses.clear();
         
-        // 绘制完整 8 字形参考轨迹 (RViz)
         double T = 2.0 * M_PI / omega_max; 
         for (double t = 0; t <= T; t += 0.05) {
             geometry_msgs::msg::PoseStamped pose;
-            // 叠加相对偏移量
             pose.pose.position.x = start_x_ + A * std::sin(omega_max * t);
             pose.pose.position.y = start_y_ + B * std::sin(2.0 * omega_max * t);
             pose.pose.position.z = start_z_ + target_z; 
@@ -109,15 +117,24 @@ private:
     void timer_callback()
     {
         px4_msgs::msg::TrajectorySetpoint msg{};
+        auto timestamp = this->get_clock()->now(); 
 
         // ================= 时间冻结与相对位置预热逻辑 =================
         if (!trajectory_started_) {
             time_step_ = 0; 
             
-            // 发布当前真实物理位置（相对零点），让误差强制为0
             if (has_odom_) {
                 msg.position = {current_odom_.position[0], current_odom_.position[1], current_odom_.position[2]};
                 msg.yaw = (float)current_yaw_;
+                
+                geometry_msgs::msg::PointStamped error_msg;
+                error_msg.header.stamp = timestamp;
+                error_msg.header.frame_id = "map";
+                error_msg.point.x = 0.0;
+                error_msg.point.y = 0.0;
+                error_msg.point.z = 0.0;
+                error_pub_->publish(error_msg);
+                
             } else {
                 msg.position = {0.0, 0.0, 0.0};
                 msg.yaw = 0.0;
@@ -126,7 +143,6 @@ private:
             msg.acceleration = {0.0, 0.0, 0.0};
             msg.yawspeed = 0.0;
 
-            auto timestamp = this->get_clock()->now();
             msg.timestamp = timestamp.nanoseconds() / 1000;
             setpoint_pub_->publish(msg);
 
@@ -134,7 +150,7 @@ private:
             if (wait_print_counter++ % 200 == 0) {
                 RCLCPP_INFO(this->get_logger(), "Waiting for Arm & Offboard... Pre-heating controller.");
             }
-            return; // 拦截后续计算
+            return; 
         }
 
         double t = static_cast<double>(time_step_) * 0.01; 
@@ -142,7 +158,7 @@ private:
         // ================= 核心物理参数 =================
         const double A = 2.0;        
         const double B = 1.0;        
-        const double omega_max = 1.8;   
+        const double omega_max = 0.314;   
         const double target_z = -1.8;     
         
         const double T_takeoff = 5.0; 
@@ -159,7 +175,24 @@ private:
         const double T_total = T_takeoff + T_accel + T_cruise + T_decel + T_land;
         const double T_wait_after_land = 3.0; 
         
+        // ================= 任务结束统计与退出 =================
         if (t > T_total + T_wait_after_land) {
+            
+            // 🌟 在终端关闭前打印盘旋阶段误差绝对值的平均值
+            if (cruise_sample_count_ > 0) {
+                double mae_x = sum_error_x_ / cruise_sample_count_;
+                double mae_y = sum_error_y_ / cruise_sample_count_;
+                double mae_z = sum_error_z_ / cruise_sample_count_;
+                
+                RCLCPP_INFO(this->get_logger(), "==================================================");
+                RCLCPP_INFO(this->get_logger(), "📊 飞行任务结束 - 【盘旋阶段】跟踪性能评估 (MAE):");
+                RCLCPP_INFO(this->get_logger(), "   👉 采集样本数: %lu", cruise_sample_count_);
+                RCLCPP_INFO(this->get_logger(), "   👉 X轴平均误差: %.4f m", mae_x);
+                RCLCPP_INFO(this->get_logger(), "   👉 Y轴平均误差: %.4f m", mae_y);
+                RCLCPP_INFO(this->get_logger(), "   👉 Z轴平均误差: %.4f m", mae_z);
+                RCLCPP_INFO(this->get_logger(), "==================================================");
+            }
+
             RCLCPP_INFO(this->get_logger(), "Mission Accomplished. Shutting down Planner...");
             rclcpp::shutdown(); 
             return; 
@@ -254,16 +287,13 @@ private:
         double c2 = std::cos(2.0 * theta);
         double s2 = std::sin(2.0 * theta);
 
-        // 位置 (叠加起点偏移)
         px = start_x_ + A * s1;
         py = start_y_ + B * s2;
         pz = start_z_ + pz;
         
-        // 速度
         double vx = A * omega * c1;
         double vy = 2.0 * B * omega * c2;
         
-        // 加速度
         double ax = A * (alpha * c1 - std::pow(omega, 2) * s1);
         double ay = 2.0 * B * (alpha * c2 - 2.0 * std::pow(omega, 2) * s2);
 
@@ -271,25 +301,41 @@ private:
         msg.velocity = {(float)vx, (float)vy, (float)vz};
         msg.acceleration = {(float)ax, (float)ay, (float)az};
 
-        // ================= 偏航角始终锁定为起飞朝向 =================
         msg.yaw = (float)start_yaw_; 
         msg.yawspeed = 0.0;          
 
-        // ================= 发送数据 =================
-        auto timestamp = this->get_clock()->now();
         msg.timestamp = timestamp.nanoseconds() / 1000;
         setpoint_pub_->publish(msg);
 
         expected_path_.header.stamp = timestamp;
         path_pub_->publish(expected_path_);
 
-// 🌟 新增：打印实时期望轨迹（每 500 毫秒打印一次，防止 100Hz 刷爆 Ubuntu 终端）
+        // ================= 计算实时误差与统计阶段误差 =================
+        geometry_msgs::msg::PointStamped error_msg;
+        error_msg.header.stamp = timestamp;
+        error_msg.header.frame_id = "map"; 
+        
+        if (has_odom_) {
+            error_msg.point.x = current_odom_.position[0] - px;
+            error_msg.point.y = current_odom_.position[1] - py;
+            error_msg.point.z = current_odom_.position[2] - pz;
+
+            // 🌟 仅在盘旋（Cruise）阶段统计平均绝对误差
+            if (t >= T_takeoff + T_accel && t < T_takeoff + T_accel + T_cruise) {
+                sum_error_x_ += std::abs(error_msg.point.x);
+                sum_error_y_ += std::abs(error_msg.point.y);
+                sum_error_z_ += std::abs(error_msg.point.z);
+                cruise_sample_count_++;
+            }
+        }
+        error_pub_->publish(error_msg);
+
         RCLCPP_INFO_THROTTLE(
             this->get_logger(), 
             *this->get_clock(), 
             500, 
-            "🎯 Setpoint -> X: % .3f, Y: % .3f, Z: % .3f | Mode Time: % .2f s", 
-            px, py, pz, t
+            "🎯 Setpoint -> X: % .3f, Y: % .3f, Z: % .3f | Err(X:%.2f, Y:%.2f) | Mode Time: % .2f s", 
+            px, py, pz, error_msg.point.x, error_msg.point.y, t
         );
 
         time_step_++;

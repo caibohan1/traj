@@ -17,6 +17,7 @@
   <depend>std_msgs</depend>
   <depend>mavros_msgs</depend>
   <depend>px4_msgs</depend>
+  <depend>rcl_interfaces</depend>
   
   <export>
     <build_type>ament_cmake</build_type>
