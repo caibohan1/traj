@@ -17,10 +17,10 @@ def generate_launch_description():
     # ==============================================================
     # 2. 配置要启动的 Node (节点)
     # ==============================================================
-    controller_node = Node(
+    mavController = Node(
         package='circle',
-        executable='controller_node',
-        name='geometric_controller',
+        executable='mavController',
+        name='mavgeometric_controller',
         output='screen',                   # 将终端日志输出到屏幕
         parameters=[config_file_path]      # 将上方的 YAML 文件喂给节点
     )
@@ -28,7 +28,7 @@ def generate_launch_description():
     # 3. 生成并返回启动描述符
     # ==============================================================
     return LaunchDescription([
-        controller_node,
+        mavController,
         # 如果你以后有别的节点想一起启动，直接在下面接着加：
         # other_node,
     ])

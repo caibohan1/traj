@@ -1,6 +1,6 @@
 # 文件路径: src/【功能包】/config/params.yaml
 
-controller_node:
+geometric_controller:
   ros__parameters:
     # 这里定义你的所有控制参数及其初始值
   # 位置比例增益 (K_p)

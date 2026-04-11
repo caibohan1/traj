@@ -16,10 +16,29 @@ using namespace std::chrono_literals;
 class GeometricController : public rclcpp::Node
 {
 public:
-    GeometricController() : Node("geometric_controller")
+    GeometricController() : Node("mavgeometric_controller")
     {
 
+       // 🌟 1. 声明参数（可以直接用 vector 数组），并赋予默认值
+        this->declare_parameter<std::vector<double>>("K_p", {6.0, 6.5, 8.0});
+        this->declare_parameter<std::vector<double>>("K_v", {2.0, 2.0, 4.0});
+        this->declare_parameter<std::vector<double>>("K_i_p", {0.2, 0.45, 2.0});
+        this->declare_parameter<std::vector<double>>("K_i_v", {0.5, 0.5, 2.0});
 
+        // 🌟 2. 获取参数值到临时的 vector 中
+        std::vector<double> kp_vec, kv_vec, kip_vec, kiv_vec;
+        this->get_parameter("K_p", kp_vec);
+        this->get_parameter("K_v", kv_vec);
+        this->get_parameter("K_i_p", kip_vec);
+        this->get_parameter("K_i_v", kiv_vec);
+
+        // 🌟 3. 仅在启动时转换一次为 Eigen::Matrix3d，存入成员变量供控制循环使用
+        K_p_ = Eigen::Vector3d(kp_vec[0], kp_vec[1], kp_vec[2]).asDiagonal();
+        K_v_ = Eigen::Vector3d(kv_vec[0], kv_vec[1], kv_vec[2]).asDiagonal();
+        K_i_p_ = Eigen::Vector3d(kip_vec[0], kip_vec[1], kip_vec[2]).asDiagonal();
+        K_i_v_ = Eigen::Vector3d(kiv_vec[0], kiv_vec[1], kiv_vec[2]).asDiagonal();
+
+        RCLCPP_INFO(this->get_logger(), "Static YAML Params Loaded! K_p[Z]: %.2f", kp_vec[2]);
 
         // --- Publishers ---
         att_sp_pub_ = this->create_publisher<mavros_msgs::msg::AttitudeTarget>("/mavros/setpoint_raw/attitude", 10);
@@ -78,6 +97,11 @@ private:
     
     rclcpp::Time last_odom_timestamp_; 
 
+    // 🌟 1. 新增：直接把四个增益矩阵作为类的成员变量存起来
+    Eigen::Matrix3d K_p_;
+    Eigen::Matrix3d K_v_;
+    Eigen::Matrix3d K_i_p_;
+    Eigen::Matrix3d K_i_v_;
     void control_loop()
     {
         if (!has_odom_ || !has_setpoint_) return;
@@ -139,12 +163,12 @@ private:
              0.0,  0.0,  0.0;
 
         // 🌟 核心修改 2：应用新架构的增益参数
-        Eigen::Matrix3d K_p = Eigen::Vector3d(6.0, 6.5, 8.0).asDiagonal();
-        Eigen::Matrix3d K_v = Eigen::Vector3d(2.0, 2.0, 4.0).asDiagonal();
+        // Eigen::Matrix3d K_p = Eigen::Vector3d(6.0, 6.5, 8.0).asDiagonal();
+        // Eigen::Matrix3d K_v = Eigen::Vector3d(2.0, 2.0, 4.0).asDiagonal();
         
-        // 分别配置位置积分增益 (K_i_p) 和速度积分增益 (K_i_v)
-        Eigen::Matrix3d K_i_p = Eigen::Vector3d(0.2, 0.45, 2.0).asDiagonal(); 
-        Eigen::Matrix3d K_i_v = Eigen::Vector3d(0.5, 0.5, 2.0).asDiagonal();
+        // // 分别配置位置积分增益 (K_i_p) 和速度积分增益 (K_i_v)
+        // Eigen::Matrix3d K_i_p = Eigen::Vector3d(0.2, 0.45, 2.0).asDiagonal(); 
+        // Eigen::Matrix3d K_i_v = Eigen::Vector3d(0.5, 0.5, 2.0).asDiagonal();
         // ================= 1. 提取当前状态 =================
         // 位置在 ENU 世界坐标系
         Eigen::Vector3d p(current_odom_.pose.pose.position.x, current_odom_.pose.pose.position.y, current_odom_.pose.pose.position.z);
@@ -190,7 +214,7 @@ private:
         integral_error_v_.z() = std::clamp(integral_error_v_.z(), -3.0, 3.0); 
 
         // 🌟 核心修改 4：将积分项融入加速度指令中
-        Eigen::Vector3d a_cmd = a_d - K_p * e_p - K_v * e_v - K_i_p * integral_error_p_ - K_i_v * integral_error_v_;
+        Eigen::Vector3d a_cmd = a_d - K_p_ * e_p - K_v_ * e_v - K_i_p_ * integral_error_p_ - K_i_v_ * integral_error_v_;
 
         // ================= 4. 推力映射 (ENU坐标系逻辑) =================
         // ENU 坐标系重力向下为 -g，补偿需要向上的 +g
