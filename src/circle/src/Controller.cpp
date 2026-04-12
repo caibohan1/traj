@@ -8,6 +8,7 @@
 #include <chrono>
 #include <algorithm>
 
+
 using namespace std::chrono_literals;
 
 class GeometricController : public rclcpp::Node
@@ -16,26 +17,59 @@ public:
     GeometricController() : Node("geometric_controller")
     {
 
-        // 🌟 1. 声明参数（可以直接用 vector 数组），并赋予默认值
-        this->declare_parameter<std::vector<double>>("K_p", {6.0, 6.5, 8.0});
-        this->declare_parameter<std::vector<double>>("K_v", {2.0, 2.0, 4.0});
-        this->declare_parameter<std::vector<double>>("K_i_p", {0.2, 0.45, 2.0});
-        this->declare_parameter<std::vector<double>>("K_i_v", {0.5, 0.5, 2.0});
+// 🌟 0. 定义一个生成参数描述符（限制范围）的辅助函数
+    auto make_float_desc = [](std::string description, double min, double max, double step) {
+        rcl_interfaces::msg::ParameterDescriptor desc;
+        desc.description = description;
+        // 🌟🌟🌟 关键修复：显式告诉 ROS 2 这是一个双精度浮点数
+        desc.type = rcl_interfaces::msg::ParameterType::PARAMETER_DOUBLE;
 
-        // 🌟 2. 获取参数值到临时的 vector 中
-        std::vector<double> kp_vec, kv_vec, kip_vec, kiv_vec;
-        this->get_parameter("K_p", kp_vec);
-        this->get_parameter("K_v", kv_vec);
-        this->get_parameter("K_i_p", kip_vec);
-        this->get_parameter("K_i_v", kiv_vec);
+        rcl_interfaces::msg::FloatingPointRange range;
+        range.from_value = min;
+        range.to_value = max;
+        range.step = step;
+        desc.floating_point_range.push_back(range);
+        return desc;
+    };
 
-        // 🌟 3. 仅在启动时转换一次为 Eigen::Matrix3d，存入成员变量供控制循环使用
-        K_p_ = Eigen::Vector3d(kp_vec[0], kp_vec[1], kp_vec[2]).asDiagonal();
-        K_v_ = Eigen::Vector3d(kv_vec[0], kv_vec[1], kv_vec[2]).asDiagonal();
-        K_i_p_ = Eigen::Vector3d(kip_vec[0], kip_vec[1], kip_vec[2]).asDiagonal();
-        K_i_v_ = Eigen::Vector3d(kiv_vec[0], kiv_vec[1], kiv_vec[2]).asDiagonal();
+// 🌟 1. 拆分数组，声明独立的标量参数
+        this->declare_parameter<double>("K_p_x", 6.0, make_float_desc("Proportional Gain P_X", 0.0, 15.0, 0.1));
+        this->declare_parameter<double>("K_p_y", 6.5, make_float_desc("Proportional Gain P_Y", 0.0, 15.0, 0.1));
+        this->declare_parameter<double>("K_p_z", 8.0, make_float_desc("Proportional Gain P_Z", 0.0, 15.0, 0.1));
 
-        RCLCPP_INFO(this->get_logger(), "Static YAML Params Loaded! K_p[Z]: %.2f", kp_vec[2]);
+        this->declare_parameter<double>("K_v_x", 2.0, make_float_desc("Derivative Gain V_X", 0.0, 10.0, 0.1));
+        this->declare_parameter<double>("K_v_y", 2.0, make_float_desc("Derivative Gain V_Y", 0.0, 10.0, 0.1));
+        this->declare_parameter<double>("K_v_z", 4.0, make_float_desc("Derivative Gain V_Z", 0.0, 10.0, 0.1));
+
+        this->declare_parameter<double>("K_i_p_x", 0.2, make_float_desc("Integral Gain P_X", 0.0, 5.0, 0.1));
+        this->declare_parameter<double>("K_i_p_y", 0.45, make_float_desc("Integral Gain P_Y", 0.0, 5.0, 0.05));
+        this->declare_parameter<double>("K_i_p_z", 2.0, make_float_desc("Integral Gain P_Z", 0.0, 5.0, 0.1));
+
+        this->declare_parameter<double>("K_i_v_x", 0.5, make_float_desc("Integral Gain V_X", 0.0, 5.0, 0.1));
+        this->declare_parameter<double>("K_i_v_y", 0.5, make_float_desc("Integral Gain V_Y", 0.0, 5.0, 0.1));
+        this->declare_parameter<double>("K_i_v_z", 2.0, make_float_desc("Integral Gain V_Z", 0.0, 5.0, 0.1));
+        // 🌟 2. 初始化 Eigen 矩阵
+        K_p_ = Eigen::Vector3d(this->get_parameter("K_p_x").as_double(),
+                               this->get_parameter("K_p_y").as_double(),
+                               this->get_parameter("K_p_z").as_double()).asDiagonal();
+
+        K_v_ = Eigen::Vector3d(this->get_parameter("K_v_x").as_double(),
+                               this->get_parameter("K_v_y").as_double(),
+                               this->get_parameter("K_v_z").as_double()).asDiagonal();
+
+        K_i_p_ = Eigen::Vector3d(this->get_parameter("K_i_p_x").as_double(),
+                                 this->get_parameter("K_i_p_y").as_double(),
+                                 this->get_parameter("K_i_p_z").as_double()).asDiagonal();
+
+        K_i_v_ = Eigen::Vector3d(this->get_parameter("K_i_v_x").as_double(),
+                                 this->get_parameter("K_i_v_y").as_double(),
+                                 this->get_parameter("K_i_v_z").as_double()).asDiagonal();
+
+        // 🌟 3. 注册参数动态回调
+        param_subscriber_ = this->add_on_set_parameters_callback(
+            std::bind(&GeometricController::parametersCallback, this, std::placeholders::_1));
+
+        RCLCPP_INFO(this->get_logger(), "Dynamic Params Loaded! K_p_z: %.2f", K_p_(2, 2));
         // --- Publishers ---
         offboard_control_mode_pub_ = this->create_publisher<px4_msgs::msg::OffboardControlMode>("/fmu/in/offboard_control_mode", 10);
         vehicle_command_pub_       = this->create_publisher<px4_msgs::msg::VehicleCommand>("/fmu/in/vehicle_command", 10);
@@ -87,6 +121,43 @@ private:
     Eigen::Matrix3d K_v_;
     Eigen::Matrix3d K_i_p_;
     Eigen::Matrix3d K_i_v_;
+
+// 参数回调句柄
+    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_subscriber_;
+
+// 🌟 4. 参数回调处理函数：当你在 rqt 中拖动滑块时，这里会被触发
+    rcl_interfaces::msg::SetParametersResult parametersCallback(const std::vector<rclcpp::Parameter> &parameters)
+    {
+        rcl_interfaces::msg::SetParametersResult result;
+        result.successful = true;
+        result.reason = "success";
+
+        for (const auto &param : parameters) {
+            // 解析 K_p
+            if (param.get_name() == "K_p_x") K_p_(0, 0) = param.as_double();
+            else if (param.get_name() == "K_p_y") K_p_(1, 1) = param.as_double();
+            else if (param.get_name() == "K_p_z") K_p_(2, 2) = param.as_double();
+            
+            // 解析 K_v
+            else if (param.get_name() == "K_v_x") K_v_(0, 0) = param.as_double();
+            else if (param.get_name() == "K_v_y") K_v_(1, 1) = param.as_double();
+            else if (param.get_name() == "K_v_z") K_v_(2, 2) = param.as_double();
+
+            // 解析 K_i_p
+            else if (param.get_name() == "K_i_p_x") K_i_p_(0, 0) = param.as_double();
+            else if (param.get_name() == "K_i_p_y") K_i_p_(1, 1) = param.as_double();
+            else if (param.get_name() == "K_i_p_z") K_i_p_(2, 2) = param.as_double();
+
+            // 解析 K_i_v
+            else if (param.get_name() == "K_i_v_x") K_i_v_(0, 0) = param.as_double();
+            else if (param.get_name() == "K_i_v_y") K_i_v_(1, 1) = param.as_double();
+            else if (param.get_name() == "K_i_v_z") K_i_v_(2, 2) = param.as_double();
+        }
+
+        RCLCPP_INFO(this->get_logger(), "Parameters updated dynamically!");
+        return result;
+    }
+
     void control_loop()
     {
         if (!has_odom_ || !has_setpoint_) return;
